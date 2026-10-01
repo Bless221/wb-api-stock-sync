@@ -1,260 +1,302 @@
-"""Product mapping layer.
+"""Asynchronous Wildberries Marketplace API v3 client with concurrent batches.
 
-Translates a warehouse stock table (Pandas ``DataFrame`` built from
-``stocks.csv``) into marketplace-specific payload structures:
+Responsibilities:
 
-* Wildberries API v3 requires **barcodes** (``sku`` field);
-* Ozon Seller API requires **text offer ids** (``offer_id`` field).
+* chunk the payload into batches of ``BATCH_SIZE`` (100) items;
+* fire multiple batches **concurrently** (not sequentially) via asyncio.gather
+  with a semaphore to respect rate limits;
+* talk to ``PUT /api/v3/stocks/{warehouseId}`` over ``aiohttp``;
+* own an **isolated** exponential backoff state.
 
-``mapping.json`` is the single source of truth that binds both identifiers
-to one internal warehouse SKU.
+Concurrency model: if one batch gets 429, only that task backs off.
+Other batches continue. Max concurrent batches is tunable via CONCURRENCY.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import random
+import time
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Iterable, Optional
+from types import TracebackType
+from typing import Any, Optional, Sequence
 
-import pandas as pd
+import aiohttp
+
+from config import Settings
+from mapper import WBStockItem
 
 logger = logging.getLogger(__name__)
 
-SKU_COLUMN = "item_sku"
-QTY_COLUMN = "quantity"
-
-
-class MappingError(Exception):
-    """Raised when the mapping file is missing, malformed or inconsistent."""
-
-
-# ----------------------------------------------------------------------
-# Marketplace payload models
-# ----------------------------------------------------------------------
-@dataclass(frozen=True, slots=True)
-class WBStockItem:
-    """Single Wildberries stock record (API v3 expects barcode + amount)."""
-
-    sku: str
-    amount: int
-
-    def to_payload(self) -> dict[str, Any]:
-        """Serialize into the WB ``PUT /api/v3/stocks/{warehouseId}`` format."""
-        return {"sku": self.sku, "amount": self.amount}
-
-
-@dataclass(frozen=True, slots=True)
-class OzonStockItem:
-    """Single Ozon stock record (offer_id + stock, optional warehouse)."""
-
-    offer_id: str
-    stock: int
-    warehouse_id: Optional[int] = None
-
-    def to_payload(self) -> dict[str, Any]:
-        """Serialize into the Ozon ``/v1/product/import/stocks`` format."""
-        payload: dict[str, Any] = {"offer_id": self.offer_id, "stock": self.stock}
-        if self.warehouse_id is not None:
-            payload["warehouse_id"] = self.warehouse_id
-        return payload
+RETRYABLE_STATUSES: frozenset[int] = frozenset({408, 425, 429, 500, 502, 503, 504})
+MAX_CONCURRENT_BATCHES = 3  # Balance between throughput and not overwhelming server
 
 
 @dataclass(slots=True)
-class MappingResult:
-    """Outcome of a single mapping pass over the stock table."""
+class WBSyncReport:
+    """Aggregated outcome of one Wildberries synchronisation run."""
 
-    wb_items: list[WBStockItem] = field(default_factory=list)
-    ozon_items: list[OzonStockItem] = field(default_factory=list)
-    unknown_skus: list[str] = field(default_factory=list)
-    inactive_skus: list[str] = field(default_factory=list)
-    invalid_rows: list[str] = field(default_factory=list)
+    marketplace: str = "wildberries"
+    total_items: int = 0
+    sent_items: int = 0
+    failed_items: int = 0
+    batches_total: int = 0
+    batches_ok: int = 0
+    batches_failed: int = 0
+    rate_limit_hits: int = 0
+    duration_seconds: float = 0.0
+    errors: list[str] = field(default_factory=list)
 
     @property
-    def summary(self) -> str:
-        """Human readable one-line summary for logs."""
+    def success(self) -> bool:
+        """``True`` when every batch has been accepted by the marketplace."""
+        return self.batches_failed == 0 and not self.errors
+
+    def as_line(self) -> str:
+        """Compact representation for log output."""
+        status = "OK" if self.success else "PARTIAL/FAIL"
         return (
-            f"WB={len(self.wb_items)} | Ozon={len(self.ozon_items)} | "
-            f"unknown={len(self.unknown_skus)} | inactive={len(self.inactive_skus)} | "
-            f"invalid={len(self.invalid_rows)}"
+            f"[WB] {status}: sent={self.sent_items}/{self.total_items}, "
+            f"batches={self.batches_ok}/{self.batches_total}, "
+            f"429_hits={self.rate_limit_hits}, time={self.duration_seconds:.2f}s"
         )
 
 
-@dataclass(frozen=True, slots=True)
-class MappingEntry:
-    """One row of ``mapping.json``."""
+class WildberriesClient:
+    """Async client for the Wildberries stocks endpoint (API v3) with concurrent batch dispatch."""
 
-    sku_internal: str
-    wb_barcode: Optional[str]
-    ozon_offer_id: Optional[str]
-    title: str = ""
-    active: bool = True
+    def __init__(
+        self,
+        settings: Settings,
+        session: Optional[aiohttp.ClientSession] = None,
+    ) -> None:
+        self._settings = settings
+        self._session = session
+        self._owns_session = session is None
 
+        self._batch_size = settings.batch_size
+        self._base_delay = settings.wb_request_delay
+        self._backoff_base = settings.wb_backoff_base
+        self._backoff_max = settings.wb_backoff_max
+        self._max_retries = settings.wb_max_retries
 
-# ----------------------------------------------------------------------
-# Mapper
-# ----------------------------------------------------------------------
-class ProductMapper:
-    """Load ``mapping.json`` and convert stock rows into marketplace payloads."""
+        # Isolated rate-limit shield state (Wildberries only).
+        self._cooldown_until: float = 0.0
+        self._state_lock = asyncio.Lock()
 
-    def __init__(self, mapping_path: Path, ozon_warehouse_id: Optional[int] = None) -> None:
-        self._mapping_path = Path(mapping_path)
-        self._ozon_warehouse_id = ozon_warehouse_id
-        self._entries: dict[str, MappingEntry] = {}
-        self.load()
-
-    # ------------------------------------------------------------------
-    # Loading
-    # ------------------------------------------------------------------
-    def load(self) -> None:
-        """Read and validate the mapping file into an in-memory index."""
-        if not self._mapping_path.exists():
-            raise MappingError(f"Mapping file not found: {self._mapping_path}")
-
-        try:
-            raw = json.loads(self._mapping_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise MappingError(f"Invalid JSON in {self._mapping_path}: {exc}") from exc
-
-        items = raw.get("items") if isinstance(raw, dict) else raw
-        if not isinstance(items, list):
-            raise MappingError("Mapping file must contain a list under the 'items' key")
-
-        entries: dict[str, MappingEntry] = {}
-        for index, row in enumerate(items):
-            if not isinstance(row, dict):
-                raise MappingError(f"Mapping item #{index} is not an object")
-
-            sku_internal = str(row.get("sku_internal", "")).strip()
-            if not sku_internal:
-                raise MappingError(f"Mapping item #{index} has an empty 'sku_internal'")
-            if sku_internal in entries:
-                raise MappingError(f"Duplicated sku_internal in mapping: {sku_internal}")
-
-            wb_barcode = self._clean_optional(row.get("wb_barcode"))
-            ozon_offer_id = self._clean_optional(row.get("ozon_offer_id"))
-            if wb_barcode is None and ozon_offer_id is None:
-                logger.warning(
-                    "Mapping entry '%s' has neither wb_barcode nor ozon_offer_id", sku_internal
-                )
-
-            entries[sku_internal] = MappingEntry(
-                sku_internal=sku_internal,
-                wb_barcode=wb_barcode,
-                ozon_offer_id=ozon_offer_id,
-                title=str(row.get("title", "")).strip(),
-                active=bool(row.get("active", True)),
-            )
-
-        self._entries = entries
-        logger.info("Mapping loaded: %d products from %s", len(entries), self._mapping_path)
-
-    @staticmethod
-    def _clean_optional(value: Any) -> Optional[str]:
-        """Normalise an optional identifier into a non-empty string or ``None``."""
-        if value is None:
-            return None
-        text = str(value).strip()
-        return text or None
+        # Semaphore to limit concurrent batch tasks
+        self._batch_semaphore = asyncio.Semaphore(MAX_CONCURRENT_BATCHES)
 
     # ------------------------------------------------------------------
-    # Introspection
+    # Context manager
     # ------------------------------------------------------------------
-    def __len__(self) -> int:
-        return len(self._entries)
+    async def __aenter__(self) -> "WildberriesClient":
+        await self._ensure_session()
+        return self
 
-    def get(self, sku_internal: str) -> Optional[MappingEntry]:
-        """Return the mapping entry for an internal SKU, if present."""
-        return self._entries.get(sku_internal)
+    async def __aexit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType],
+    ) -> None:
+        await self.close()
 
-    def known_skus(self) -> Iterable[str]:
-        """Iterate over all internal SKUs known to the mapper."""
-        return self._entries.keys()
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        """Create the ``aiohttp`` session lazily if it was not injected."""
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=self._settings.request_timeout)
+            connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+            self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+            self._owns_session = True
+        return self._session
+
+    async def close(self) -> None:
+        """Close the session if this client owns it."""
+        if self._owns_session and self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
     # ------------------------------------------------------------------
-    # Core translation
+    # Public API
     # ------------------------------------------------------------------
-    def map_dataframe(self, df: pd.DataFrame) -> MappingResult:
-        """Convert a stock ``DataFrame`` into WB and Ozon payload items.
+    async def update_stocks(self, items: Sequence[WBStockItem]) -> WBSyncReport:
+        """Push stock levels to Wildberries in concurrent batches of 100 items.
 
-        The frame must contain the ``item_sku`` and ``quantity`` columns.
-        Rows with unknown SKUs, inactive products or invalid quantities are
-        collected into the result instead of raising, so a single bad line
-        never breaks the whole synchronisation cycle.
+        Launches up to MAX_CONCURRENT_BATCHES tasks simultaneously,
+        respecting the global cooldown window and per-task backoff.
         """
-        self._validate_frame(df)
-        result = MappingResult()
+        started = time.monotonic()
+        report = WBSyncReport(total_items=len(items))
 
-        for row in df.itertuples(index=False):
-            raw_sku = getattr(row, SKU_COLUMN)
-            raw_qty = getattr(row, QTY_COLUMN)
+        if not items:
+            logger.info("[WB] Nothing to sync: empty item list")
+            report.duration_seconds = time.monotonic() - started
+            return report
 
-            sku_internal = str(raw_sku).strip()
-            if not sku_internal:
-                result.invalid_rows.append("<empty item_sku>")
-                continue
+        await self._ensure_session()
+        batches = list(self._chunk(items, self._batch_size))
+        report.batches_total = len(batches)
+        logger.info("[WB] Starting sync: %d items in %d batches (max_concurrent=%d)",
+                    len(items), len(batches), MAX_CONCURRENT_BATCHES)
 
-            quantity = self._coerce_quantity(raw_qty)
-            if quantity is None:
-                result.invalid_rows.append(sku_internal)
-                continue
+        tasks = [
+            self._send_batch_guarded(batch, number + 1, report)
+            for number, batch in enumerate(batches)
+        ]
 
-            entry = self._entries.get(sku_internal)
-            if entry is None:
-                result.unknown_skus.append(sku_internal)
-                continue
-            if not entry.active:
-                result.inactive_skus.append(sku_internal)
-                continue
+        await asyncio.gather(*tasks, return_exceptions=False)
 
-            if entry.wb_barcode:
-                result.wb_items.append(WBStockItem(sku=entry.wb_barcode, amount=quantity))
-            if entry.ozon_offer_id:
-                result.ozon_items.append(
-                    OzonStockItem(
-                        offer_id=entry.ozon_offer_id,
-                        stock=quantity,
-                        warehouse_id=self._ozon_warehouse_id,
-                    )
+        report.duration_seconds = time.monotonic() - started
+        logger.info(report.as_line())
+        return report
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _chunk(items: Sequence[WBStockItem], size: int) -> list[Sequence[WBStockItem]]:
+        """Split a sequence into consecutive chunks of ``size`` elements."""
+        return [items[index : index + size] for index in range(0, len(items), size)]
+
+    async def _send_batch_guarded(
+        self,
+        batch: Sequence[WBStockItem],
+        number: int,
+        report: WBSyncReport,
+    ) -> None:
+        """Acquire semaphore, then send a batch with isolated exponential backoff."""
+        async with self._batch_semaphore:
+            try:
+                await self._send_batch(batch, number, report)
+            except Exception as exc:  # noqa: BLE001 - one batch must not kill the run
+                report.batches_failed += 1
+                report.failed_items += len(batch)
+                message = f"batch {number}: {exc}"
+                report.errors.append(message)
+                logger.error("[WB] Batch %d failed: %s", number, exc)
+
+    async def _send_batch(
+        self,
+        batch: Sequence[WBStockItem],
+        number: int,
+        report: WBSyncReport,
+    ) -> None:
+        """Send a single batch with isolated exponential backoff retry loop."""
+        payload: dict[str, Any] = {"stocks": [item.to_payload() for item in batch]}
+        url = self._settings.wb_stocks_url
+        headers = self._settings.wb_headers()
+        attempt = 0
+
+        while True:
+            await self._await_cooldown()
+            session = await self._ensure_session()
+
+            try:
+                async with session.put(url, json=payload, headers=headers) as response:
+                    status = response.status
+                    body = await response.text()
+
+                    if status in (200, 204):
+                        await self._relax_cooldown()
+                        report.batches_ok += 1
+                        report.sent_items += len(batch)
+                        logger.info("[WB] Batch %d accepted (%d items)", number, len(batch))
+                        return
+
+                    if status == 429:
+                        report.rate_limit_hits += 1
+
+                    if status in RETRYABLE_STATUSES and attempt < self._max_retries:
+                        delay = await self._register_failure(attempt, self._retry_after(response))
+                        logger.warning(
+                            "[WB] Batch %d got HTTP %d, retry %d/%d in %.1fs",
+                            number,
+                            status,
+                            attempt + 1,
+                            self._max_retries,
+                            delay,
+                        )
+                        attempt += 1
+                        await asyncio.sleep(delay)
+                        continue
+
+                    error_summary = self._parse_error_body(body)
+                    raise RuntimeError(f"HTTP {status}: {error_summary}")
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt >= self._max_retries:
+                    raise RuntimeError(f"network error: {exc}") from exc
+                delay = await self._register_failure(attempt, None)
+                logger.warning(
+                    "[WB] Batch %d network error (%s), retry %d/%d in %.1fs",
+                    number,
+                    exc,
+                    attempt + 1,
+                    self._max_retries,
+                    delay,
                 )
+                attempt += 1
+                await asyncio.sleep(delay)
 
-        if result.unknown_skus:
-            logger.warning(
-                "Unmapped SKUs skipped (%d): %s",
-                len(result.unknown_skus),
-                ", ".join(result.unknown_skus[:10]),
-            )
-        if result.invalid_rows:
-            logger.warning(
-                "Rows with invalid quantity skipped (%d): %s",
-                len(result.invalid_rows),
-                ", ".join(result.invalid_rows[:10]),
-            )
+    async def _register_failure(self, attempt: int, retry_after: Optional[float]) -> float:
+        """Compute the next backoff delay and arm the WB-only cooldown window."""
+        delay = self._backoff_base * (2 ** attempt)
+        delay = min(delay, self._backoff_max)
+        if retry_after is not None:
+            delay = max(delay, min(retry_after, self._backoff_max))
+        delay += random.uniform(0.0, min(1.0, delay * 0.1))  # jitter
 
-        logger.info("Mapping result: %s", result.summary)
-        return result
+        async with self._state_lock:
+            self._cooldown_until = max(self._cooldown_until, time.monotonic() + delay)
+        return delay
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _validate_frame(df: pd.DataFrame) -> None:
-        """Ensure the stock frame exposes the required columns."""
-        missing = [column for column in (SKU_COLUMN, QTY_COLUMN) if column not in df.columns]
-        if missing:
-            raise MappingError(
-                f"Stock file must contain columns {SKU_COLUMN!r} and {QTY_COLUMN!r}; "
-                f"missing: {missing}"
-            )
+    async def _relax_cooldown(self) -> None:
+        """Drop the cooldown window after a successful call."""
+        async with self._state_lock:
+            self._cooldown_until = 0.0
+
+    async def _await_cooldown(self) -> None:
+        """Sleep until the client-local cooldown window expires."""
+        async with self._state_lock:
+            remaining = self._cooldown_until - time.monotonic()
+        if remaining > 0:
+            logger.debug("[WB] Cooling down for %.1fs", remaining)
+            await asyncio.sleep(remaining)
 
     @staticmethod
-    def _coerce_quantity(value: Any) -> Optional[int]:
-        """Cast a raw cell value into a non-negative integer quantity."""
-        if pd.isna(value):
+    def _retry_after(response: aiohttp.ClientResponse) -> Optional[float]:
+        """Parse the ``Retry-After`` header when the server provides one."""
+        raw = response.headers.get("Retry-After")
+        if not raw:
             return None
         try:
-            quantity = int(float(value))
-        except (TypeError, ValueError):
+            return float(raw)
+        except ValueError:
             return None
-        return max(quantity, 0)
+
+    @staticmethod
+    def _parse_error_body(text: str) -> str:
+        """Parse and clean error response body (JSON or plain text)."""
+        text = text.strip()
+        if not text:
+            return "<empty response>"
+
+        # Try to parse as JSON and extract meaningful error message
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                # Check for common error fields
+                for key in ("message", "error", "errorText", "description"):
+                    if key in data:
+                        msg = data[key]
+                        if isinstance(msg, str):
+                            return msg[:500]
+                # If no standard field, return stringified dict (first 500 chars)
+                return str(data)[:500]
+            return str(data)[:500]
+        except (json.JSONDecodeError, ValueError):
+            # Plain text response
+            return text[:500]
