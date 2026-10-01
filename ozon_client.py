@@ -12,14 +12,28 @@ from typing import Any, Optional, Sequence
 import aiohttp
 
 from config import Settings
-from exceptions import CriticalAPIError
 from mapper import OzonStockItem
 
 logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUSES: frozenset[int] = frozenset({408, 425, 429, 500, 502, 503, 504})
 CRITICAL_STATUSES: frozenset[int] = frozenset({401, 403})
-MAX_CONCURRENT_BATCHES = 3  # Balance between throughput and not overwhelming server
+
+
+class CriticalAPIError(Exception):
+    """Raised when API returns a critical, non-recoverable error (401, 403).
+
+    When caught at the scheduler level, triggers immediate shutdown to prevent
+    spam and wasted retry cycles.
+    """
+
+    def __init__(self, marketplace: str, status_code: int, message: str) -> None:
+        self.marketplace = marketplace
+        self.status_code = status_code
+        self.message = message
+        super().__init__(
+            f"[{marketplace.upper()}] Critical API error (HTTP {status_code}): {message}"
+        )
 
 
 @dataclass(slots=True)
@@ -54,42 +68,74 @@ class OzonSyncReport:
 
 
 class OzonClient:
-    """Async client for ``POST /v1/product/import/stocks`` with concurrent batches.
+    """Async client for ``POST /v1/product/import/stocks`` with parallel batches.
 
-    Session is injected from the caller (main.py) to enable connection pooling and reuse.
+    Key improvements:
+    - Batches are sent in parallel via asyncio.gather (up to max_concurrent_batches)
+    - Semaphore limits concurrent requests to prevent overwhelming the server
+    - Critical errors (401, 403) trigger CriticalAPIError for scheduler shutdown
+    - SecretStr tokens are properly extracted via .get_secret_value()
     """
 
-    def __init__(
-            self,
-            settings: Settings,
-            session: aiohttp.ClientSession,
-    ) -> None:
+    def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._session = session
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._owns_session = True
 
         self._batch_size = settings.batch_size
         self._base_delay = settings.ozon_request_delay
         self._backoff_base = settings.ozon_backoff_base
         self._backoff_max = settings.ozon_backoff_max
         self._max_retries = settings.ozon_max_retries
+        self._max_concurrent_batches = settings.max_concurrent_batches
 
-        # Isolated rate-limit shield state (Ozon only).
+        # Isolated rate-limit shield state (Ozon only)
         self._cooldown_until: float = 0.0
         self._state_lock = asyncio.Lock()
 
         # Semaphore to limit concurrent batch tasks
-        self._batch_semaphore = asyncio.Semaphore(MAX_CONCURRENT_BATCHES)
+        self._batch_semaphore = asyncio.Semaphore(self._max_concurrent_batches)
+
+    # ------------------------------------------------------------------
+    # Context manager
+    # ------------------------------------------------------------------
+    async def __aenter__(self) -> "OzonClient":
+        await self._ensure_session()
+        return self
+
+    async def __aexit__(
+            self,
+            exc_type: Optional[type[BaseException]],
+            exc: Optional[BaseException],
+            tb: Optional[TracebackType],
+    ) -> None:
+        await self.close()
+
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        """Create the ``aiohttp`` session lazily if needed."""
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=self._settings.request_timeout)
+            connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+            self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+            self._owns_session = True
+        return self._session
+
+    async def close(self) -> None:
+        """Close the session if this client owns it."""
+        if self._owns_session and self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
     async def update_stocks(self, items: Sequence[OzonStockItem]) -> OzonSyncReport:
-        """Push stock levels to Ozon in concurrent batches of 100 items.
+        """Push stock levels to Ozon in parallel batches of batch_size items.
 
-        Launches up to MAX_CONCURRENT_BATCHES tasks simultaneously.
+        Launches up to max_concurrent_batches tasks simultaneously via asyncio.gather.
 
         Raises:
-            CriticalAPIError: When API returns 401 or 403 status.
+            CriticalAPIError: When API returns 401 or 403 status codes.
         """
         started = time.monotonic()
         report = OzonSyncReport(total_items=len(items))
@@ -99,20 +145,23 @@ class OzonClient:
             report.duration_seconds = time.monotonic() - started
             return report
 
+        await self._ensure_session()
         batches = list(self._chunk(items, self._batch_size))
         report.batches_total = len(batches)
         logger.info(
             "[OZON] Starting sync: %d items in %d batches (max_concurrent=%d)",
             len(items),
             len(batches),
-            MAX_CONCURRENT_BATCHES,
+            self._max_concurrent_batches,
         )
 
+        # Create all batch tasks and run them in parallel with asyncio.gather
         tasks = [
             self._send_batch_guarded(batch, number + 1, report)
             for number, batch in enumerate(batches)
         ]
 
+        # Gather runs all tasks concurrently (subject to semaphore limit)
         await asyncio.gather(*tasks, return_exceptions=False)
 
         report.duration_seconds = time.monotonic() - started
@@ -133,7 +182,11 @@ class OzonClient:
             number: int,
             report: OzonSyncReport,
     ) -> None:
-        """Acquire semaphore, then send a batch with isolated exponential backoff."""
+        """Acquire semaphore, then send a batch with isolated exponential backoff.
+
+        Raises:
+            CriticalAPIError: Re-raised from _send_batch to stop the scheduler.
+        """
         async with self._batch_semaphore:
             try:
                 body = await self._send_batch(batch, number, report)
@@ -162,18 +215,19 @@ class OzonClient:
         """
         payload: dict[str, Any] = {"stocks": [item.to_payload() for item in batch]}
         url = self._settings.ozon_stocks_url
-        headers = self._settings.ozon_headers()
+        headers = self._settings.ozon_headers()  # Tokens properly extracted here
         attempt = 0
 
         while True:
             await self._await_cooldown()
+            session = await self._ensure_session()
 
             try:
-                async with self._session.post(url, json=payload, headers=headers) as response:
+                async with session.post(url, json=payload, headers=headers) as response:
                     status = response.status
                     text = await response.text()
 
-                    # Critical errors: stop immediately
+                    # Critical errors: stop immediately without retry
                     if status in CRITICAL_STATUSES:
                         error_summary = self._parse_error_body(text)
                         raise CriticalAPIError(

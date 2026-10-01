@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     ozon_client_id: SecretStr = Field(..., description="Ozon Client-Id header")
     ozon_api_key: SecretStr = Field(..., description="Ozon Api-Key header")
     ozon_base_url: str = Field(default="https://api-seller.ozon.ru")
-    ozone_warehouse_id: Optional[int] = Field(default=None, gt=0)
+    ozon_warehouse_id: Optional[int] = Field(default=None, gt=0)
 
     # ------------------------------------------------------------------
     # Marketplace toggles (commercial tiers)
@@ -71,7 +71,7 @@ class Settings(BaseSettings):
     run_on_startup: bool = Field(default=True)
 
     # ------------------------------------------------------------------
-    # File stability checking (защита от недописанных файлов)
+    # File stability checking (защита от недописанных файлов из 1С)
     # ------------------------------------------------------------------
     csv_wait_timeout: int = Field(
         default=10,
@@ -93,13 +93,23 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
-    # Streaming chunk size (защита от OOM)
+    # Streaming chunk size (защита от OOM при загрузке больших CSV)
     # ------------------------------------------------------------------
-    stream_chunk_size: int = Field(
+    csv_chunk_size: int = Field(
         default=10000,
         ge=1000,
         le=100000,
         description="Rows per chunk when streaming CSV to prevent OOM",
+    )
+
+    # ------------------------------------------------------------------
+    # Parallel batch settings
+    # ------------------------------------------------------------------
+    max_concurrent_batches: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Maximum number of concurrent batch uploads per marketplace",
     )
 
     # ------------------------------------------------------------------
@@ -166,7 +176,11 @@ class Settings(BaseSettings):
         return f"{self.ozon_base_url}/v1/product/import/stocks"
 
     def wb_headers(self) -> dict[str, str]:
-        """Authorization headers for Wildberries."""
+        """Authorization headers for Wildberries.
+
+        IMPORTANT: Tokens are extracted via .get_secret_value() to avoid
+        sending the masked "SecretStr(***)" string instead of the real token.
+        """
         return {
             "Authorization": self.wb_api_token.get_secret_value(),
             "Content-Type": "application/json",
@@ -174,7 +188,11 @@ class Settings(BaseSettings):
         }
 
     def ozon_headers(self) -> dict[str, str]:
-        """Authorization headers for Ozon."""
+        """Authorization headers for Ozon.
+
+        IMPORTANT: Tokens are extracted via .get_secret_value() to avoid
+        sending the masked "SecretStr(***)" string instead of the real token.
+        """
         return {
             "Client-Id": self.ozon_client_id.get_secret_value(),
             "Api-Key": self.ozon_api_key.get_secret_value(),

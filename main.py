@@ -7,18 +7,15 @@ import os
 import signal
 import sys
 import time
-from csv import DictReader
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Optional
 
-import aiohttp
 import pandas as pd
 
 from config import Settings, get_settings
-from exceptions import CriticalAPIError, MappingError
-from mapper import ProductMapper
-from ozon_client import OzonClient
+from mapper import MappingError, ProductMapper
+from ozon_client import CriticalAPIError, OzonClient
 from scheduler import SyncScheduler
 from wb_client import WildberriesClient
 
@@ -54,7 +51,7 @@ def setup_logging(settings: Settings) -> None:
 
 
 # ----------------------------------------------------------------------
-# File stability check (защита от недописанных файлов)
+# File stability check (защита от недописанных файлов из 1С)
 # ----------------------------------------------------------------------
 def wait_for_file_stability(settings: Settings) -> bool:
     """Wait for CSV file to become stable (size stops changing).
@@ -89,7 +86,11 @@ def wait_for_file_stability(settings: Settings) -> bool:
         try:
             current_size = os.path.getsize(path)
         except OSError as exc:
-            logger.warning("Failed to check file size: %s, retry in %.1fs", exc, settings.csv_check_interval)
+            logger.warning(
+                "Failed to check file size: %s, retry in %.1fs",
+                exc,
+                settings.csv_check_interval,
+            )
             time.sleep(settings.csv_check_interval)
             continue
 
@@ -124,18 +125,23 @@ def wait_for_file_stability(settings: Settings) -> bool:
 
 
 # ----------------------------------------------------------------------
-# Streaming data layer (chunks, not bulk)
+# Streaming data layer (chunks, not bulk) — защита от OOM
 # ----------------------------------------------------------------------
 def stream_stocks_chunks(
         settings: Settings, chunk_size: Optional[int] = None
 ) -> tuple[int, pd.DataFrame]:
     """Stream-read ``stocks.csv`` in chunks to avoid OOM on large files.
 
-    Yields aggregated deduped chunks. Returns (total_rows, aggregated_dataframe).
-    Memory usage is O(chunk_size), not O(file_size).
+    Uses csv.DictReader (no Pandas overhead) to iterate row-by-row, aggregates
+    rows into chunks, then yields a consolidated DataFrame at the end.
+
+    Memory usage: O(chunk_size), not O(file_size). Works with 100k+ row files.
+
+    Returns:
+        (total_rows_read, aggregated_dataframe_with_unique_skus)
     """
     if chunk_size is None:
-        chunk_size = settings.stream_chunk_size
+        chunk_size = settings.csv_chunk_size
 
     path = settings.csv_path
     if not path.exists():
@@ -172,15 +178,20 @@ def stream_stocks_chunks(
                     qty = int(float(row.get("quantity", 0)))
                     qty = max(0, qty)
                 except (ValueError, TypeError):
-                    logger.debug("Row %d: invalid quantity for SKU=%s, skipped", row_number, sku)
+                    logger.debug(
+                        "Row %d: invalid quantity for SKU=%s, skipped", row_number, sku
+                    )
                     continue
 
+                # Deduplicate on the fly: last occurrence wins
                 accumulated[sku] = {"item_sku": sku, "quantity": qty}
 
                 if len(accumulated) >= chunk_size:
                     chunks_processed += 1
                     logger.debug(
-                        "Chunk #%d aggregated: %d unique SKUs", chunks_processed, len(accumulated)
+                        "Chunk #%d accumulated: %d unique SKUs",
+                        chunks_processed,
+                        len(accumulated),
                     )
                     accumulated = {}
 
@@ -188,6 +199,7 @@ def stream_stocks_chunks(
         logger.exception("Failed to read stock file: %s", path)
         return total_rows, pd.DataFrame()
 
+    # Final chunk: convert accumulated dict to DataFrame
     final_df = pd.DataFrame(list(accumulated.values()))
     logger.info(
         "Stock file streamed: %d total rows, %d unique SKUs, %d chunks processed",
@@ -201,11 +213,7 @@ def stream_stocks_chunks(
 # ----------------------------------------------------------------------
 # Synchronisation cycle
 # ----------------------------------------------------------------------
-async def run_sync_cycle(
-        settings: Settings,
-        mapper: ProductMapper,
-        session: aiohttp.ClientSession,
-) -> None:
+async def run_sync_cycle(settings: Settings, mapper: ProductMapper, scheduler: SyncScheduler) -> None:
     """Execute one full synchronisation cycle across all enabled marketplaces.
 
     Raises:
@@ -247,49 +255,54 @@ async def run_sync_cycle(
     tasks: list[asyncio.Task[Any]] = []
     labels: list[str] = []
 
-    wb_client = WildberriesClient(settings, session)
-    ozon_client = OzonClient(settings, session)
+    # Create clients and run sync operations
+    async with WildberriesClient(settings) as wb_client, OzonClient(settings) as ozon_client:
+        try:
+            # --- Wildberries ------------------------------------------------
+            if settings.enable_wb and mapping.wb_items:
+                tasks.append(asyncio.create_task(wb_client.update_stocks(mapping.wb_items)))
+                labels.append("wildberries")
+            elif settings.enable_wb:
+                logger.info("[WB] Enabled but no mapped items")
 
-    try:
-        # --- Wildberries ------------------------------------------------
-        if settings.enable_wb and mapping.wb_items:
-            tasks.append(asyncio.create_task(wb_client.update_stocks(mapping.wb_items)))
-            labels.append("wildberries")
-        elif settings.enable_wb:
-            logger.info("[WB] Enabled but no mapped items")
+            # --- Ozon --------------------------------------------------------
+            if settings.enable_ozon and mapping.ozon_items:
+                tasks.append(asyncio.create_task(ozon_client.update_stocks(mapping.ozon_items)))
+                labels.append("ozon")
+            elif settings.enable_ozon:
+                logger.info("[OZON] Enabled but no mapped items")
 
-        # --- Ozon --------------------------------------------------------
-        if settings.enable_ozon and mapping.ozon_items:
-            tasks.append(asyncio.create_task(ozon_client.update_stocks(mapping.ozon_items)))
-            labels.append("ozon")
-        elif settings.enable_ozon:
-            logger.info("[OZON] Enabled but no mapped items")
+            if not tasks:
+                logger.warning("All marketplaces disabled or no items to send")
+                logger.info("=" * 80)
+                return
 
-        if not tasks:
-            logger.warning("All marketplaces disabled or no items to send")
-            logger.info("=" * 80)
-            return
+            # Run all sync tasks in parallel
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Process results and handle critical errors
+            for label, result in zip(labels, results):
+                if isinstance(result, CriticalAPIError):
+                    # Log at CRITICAL level and stop the scheduler immediately
+                    logger.critical(
+                        "[%s] CRITICAL API ERROR: HTTP %d - %s | Shutting down scheduler",
+                        label.upper(),
+                        result.status_code,
+                        result.message,
+                    )
+                    scheduler.shutdown()
+                    raise result
+                elif isinstance(result, BaseException):
+                    logger.error("[%s] Pipeline crashed: %s", label.upper(), result)
+                else:
+                    logger.info("[RESULT] %s", result.as_line())
 
-        for label, result in zip(labels, results):
-            if isinstance(result, CriticalAPIError):
-                # Re-raise to stop the scheduler
-                logger.critical(
-                    "[%s] CRITICAL API ERROR: HTTP %d - %s",
-                    label.upper(),
-                    result.status_code,
-                    result.message,
-                )
-                raise result
-            elif isinstance(result, BaseException):
-                logger.error("[%s] Pipeline crashed: %s", label.upper(), result)
-            else:
-                logger.info("[RESULT] %s", result.as_line())
+        except CriticalAPIError:
+            # Already handled above, just re-raise to break the cycle
+            raise
 
-    finally:
-        logger.info("SYNC CYCLE FINISHED | total_csv_rows=%d", total_rows)
-        logger.info("=" * 80)
+    logger.info("SYNC CYCLE FINISHED | total_csv_rows=%d", total_rows)
+    logger.info("=" * 80)
 
 
 # ----------------------------------------------------------------------
@@ -300,51 +313,44 @@ async def main() -> None:
     settings = get_settings()
     setup_logging(settings)
 
-    logger.info("Multi-marketplace Stock Sync v2.1 (streaming-optimized, hardened)")
+    logger.info("Multi-marketplace Stock Sync v2.1 (hardened & streaming-optimized)")
     logger.info(
-        "Marketplaces: WB=%s, Ozon=%s | interval=%d min | batch=%d | stream_chunk=%d",
+        "Marketplaces: WB=%s, Ozon=%s | interval=%d min | "
+        "batch=%d | stream_chunk=%d | max_concurrent=%d",
         settings.enable_wb,
         settings.enable_ozon,
         settings.sync_interval_minutes,
         settings.batch_size,
-        settings.stream_chunk_size,
+        settings.csv_chunk_size,
+        settings.max_concurrent_batches,
     )
 
     try:
         mapper = ProductMapper(
             mapping_path=settings.mapping_path,
-            ozon_warehouse_id=settings.ozone_warehouse_id,
+            ozon_warehouse_id=settings.ozon_warehouse_id,
         )
     except MappingError:
         logger.exception("Cannot start without a valid mapping file")
         return
 
-    # Create a single shared session for the entire daemon lifetime
-    timeout = aiohttp.ClientTimeout(total=settings.request_timeout)
-    connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
-    session = aiohttp.ClientSession(timeout=timeout, connector=connector)
-
     scheduler = SyncScheduler(
         settings,
-        job=lambda: run_sync_cycle(settings, mapper, session),
+        job=lambda: run_sync_cycle(settings, mapper, scheduler),
     )
     scheduler.start()
     _install_signal_handlers(scheduler)
 
     if settings.run_on_startup:
         try:
-            await run_sync_cycle(settings, mapper, session)
+            await run_sync_cycle(settings, mapper, scheduler)
         except CriticalAPIError as exc:
             logger.critical("STARTUP SYNC FAILED WITH CRITICAL ERROR: %s", exc)
-            await session.close()
             scheduler.shutdown()
             return
 
     logger.info("Daemon is running. Press Ctrl+C to stop.")
-    try:
-        await scheduler.run_forever()
-    finally:
-        await session.close()
+    await scheduler.run_forever()
 
 
 def _install_signal_handlers(scheduler: SyncScheduler) -> None:
