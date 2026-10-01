@@ -1,10 +1,3 @@
-"""Typed and validated application settings.
-
-Replaces the legacy ``os.getenv()`` calls with a strict Pydantic-settings
-model: the process refuses to start if any credential is missing or malformed,
-instead of failing later in the middle of a network request.
-"""
-
 from __future__ import annotations
 
 from functools import lru_cache
@@ -40,7 +33,7 @@ class Settings(BaseSettings):
     ozon_client_id: SecretStr = Field(..., description="Ozon Client-Id header")
     ozon_api_key: SecretStr = Field(..., description="Ozon Api-Key header")
     ozon_base_url: str = Field(default="https://api-seller.ozon.ru")
-    ozon_warehouse_id: Optional[int] = Field(default=None, gt=0)
+    ozone_warehouse_id: Optional[int] = Field(default=None, gt=0)
 
     # ------------------------------------------------------------------
     # Marketplace toggles (commercial tiers)
@@ -76,6 +69,38 @@ class Settings(BaseSettings):
     request_timeout: int = Field(default=30, ge=1, le=300)
     sync_interval_minutes: int = Field(default=15, ge=1, le=1440)
     run_on_startup: bool = Field(default=True)
+
+    # ------------------------------------------------------------------
+    # File stability checking (защита от недописанных файлов)
+    # ------------------------------------------------------------------
+    csv_wait_timeout: int = Field(
+        default=10,
+        ge=1,
+        le=300,
+        description="Maximum seconds to wait for CSV file to stabilize",
+    )
+    csv_stability_window: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        description="Consecutive seconds size must be unchanged to consider file stable",
+    )
+    csv_check_interval: float = Field(
+        default=1.0,
+        ge=0.1,
+        le=5.0,
+        description="Interval in seconds between file size checks",
+    )
+
+    # ------------------------------------------------------------------
+    # Streaming chunk size (защита от OOM)
+    # ------------------------------------------------------------------
+    stream_chunk_size: int = Field(
+        default=10000,
+        ge=1000,
+        le=100000,
+        description="Rows per chunk when streaming CSV to prevent OOM",
+    )
 
     # ------------------------------------------------------------------
     # Logging

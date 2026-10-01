@@ -1,11 +1,3 @@
-"""Non-blocking background scheduler.
-
-Keeps the APScheduler stack of v1.x but swaps ``BlockingScheduler`` for
-``AsyncIOScheduler``: the job coroutine is executed directly inside the
-running event loop, so HTTP calls to both marketplaces stay concurrent
-while the scheduler itself never blocks the thread.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -17,6 +9,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from config import Settings
+from exceptions import CriticalAPIError
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +17,10 @@ JOB_ID = "marketplace_stock_sync"
 
 
 class SyncScheduler:
-    """Thin wrapper around :class:`AsyncIOScheduler` for the sync job."""
+    """Thin wrapper around :class:`AsyncIOScheduler` for the sync job.
+
+    Detects CriticalAPIError and initiates immediate graceful shutdown.
+    """
 
     def __init__(
         self,
@@ -78,12 +74,19 @@ class SyncScheduler:
     # Internals
     # ------------------------------------------------------------------
     async def _guarded_job(self) -> None:
-        """Run the job coroutine, swallowing exceptions to keep the loop alive."""
+        """Run the job coroutine with special handling for critical errors."""
         try:
             await self._job()
+        except CriticalAPIError as exc:
+            # Log at CRITICAL level and stop the scheduler immediately
+            logger.critical(
+                "CRITICAL API ERROR DETECTED: %s | Shutting down scheduler to prevent spam",
+                exc,
+            )
+            self.shutdown(wait=False)
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - scheduler must survive any job error
+        except Exception:  # noqa: BLE001 - scheduler must survive normal job errors
             logger.exception("Scheduled synchronisation crashed")
 
     @staticmethod

@@ -3,18 +3,21 @@ from __future__ import annotations
 import asyncio
 import csv
 import logging
+import os
 import signal
 import sys
+import time
 from csv import DictReader
-from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Optional
 
+import aiohttp
 import pandas as pd
 
 from config import Settings, get_settings
-from mapper import MappingError, MappingResult, ProductMapper
+from exceptions import CriticalAPIError, MappingError
+from mapper import ProductMapper
 from ozon_client import OzonClient
 from scheduler import SyncScheduler
 from wb_client import WildberriesClient
@@ -51,16 +54,89 @@ def setup_logging(settings: Settings) -> None:
 
 
 # ----------------------------------------------------------------------
+# File stability check (защита от недописанных файлов)
+# ----------------------------------------------------------------------
+def wait_for_file_stability(settings: Settings) -> bool:
+    """Wait for CSV file to become stable (size stops changing).
+
+    This protects against reading partially-written files from 1С or MoySklad.
+    Polls the file size with configurable intervals and waits until it remains
+    unchanged for `csv_stability_window` consecutive checks.
+
+    Returns:
+        True if file stabilized within timeout, False if timeout exceeded.
+    """
+    path = settings.csv_path
+    if not path.exists():
+        logger.error("Stock file not found: %s", path)
+        return False
+
+    logger.info("Waiting for CSV file to stabilize: %s", path)
+
+    start_time = time.monotonic()
+    last_size: Optional[int] = None
+    stable_count = 0
+
+    while True:
+        elapsed = time.monotonic() - start_time
+        if elapsed > settings.csv_wait_timeout:
+            logger.error(
+                "CSV file did not stabilize within %d seconds (timeout)",
+                settings.csv_wait_timeout,
+            )
+            return False
+
+        try:
+            current_size = os.path.getsize(path)
+        except OSError as exc:
+            logger.warning("Failed to check file size: %s, retry in %.1fs", exc, settings.csv_check_interval)
+            time.sleep(settings.csv_check_interval)
+            continue
+
+        if last_size is None:
+            last_size = current_size
+            logger.debug("Initial file size: %d bytes", current_size)
+        elif current_size == last_size:
+            stable_count += 1
+            logger.debug(
+                "File size unchanged: %d bytes (stable_count=%d/%d)",
+                current_size,
+                stable_count,
+                settings.csv_stability_window,
+            )
+            if stable_count >= settings.csv_stability_window:
+                logger.info(
+                    "CSV file is stable: %d bytes (after %.1fs)",
+                    current_size,
+                    elapsed,
+                )
+                return True
+        else:
+            stable_count = 0
+            logger.debug(
+                "File size changed: %d -> %d bytes (resetting stable counter)",
+                last_size,
+                current_size,
+            )
+            last_size = current_size
+
+        time.sleep(settings.csv_check_interval)
+
+
+# ----------------------------------------------------------------------
 # Streaming data layer (chunks, not bulk)
 # ----------------------------------------------------------------------
 def stream_stocks_chunks(
-    settings: Settings, chunk_size: int = 5000
+        settings: Settings, chunk_size: Optional[int] = None
 ) -> tuple[int, pd.DataFrame]:
     """Stream-read ``stocks.csv`` in chunks to avoid OOM on large files.
 
     Yields aggregated deduped chunks. Returns (total_rows, aggregated_dataframe).
     Memory usage is O(chunk_size), not O(file_size).
     """
+    if chunk_size is None:
+        chunk_size = settings.stream_chunk_size
+
     path = settings.csv_path
     if not path.exists():
         logger.error("Stock file not found: %s", path)
@@ -125,12 +201,26 @@ def stream_stocks_chunks(
 # ----------------------------------------------------------------------
 # Synchronisation cycle
 # ----------------------------------------------------------------------
-async def run_sync_cycle(settings: Settings, mapper: ProductMapper) -> None:
-    """Execute one full synchronisation cycle across all enabled marketplaces."""
+async def run_sync_cycle(
+        settings: Settings,
+        mapper: ProductMapper,
+        session: aiohttp.ClientSession,
+) -> None:
+    """Execute one full synchronisation cycle across all enabled marketplaces.
+
+    Raises:
+        CriticalAPIError: If marketplace API returns 401 or 403.
+    """
     logger.info("=" * 80)
     logger.info("SYNC CYCLE STARTED")
 
-    total_rows, df = stream_stocks_chunks(settings, chunk_size=10000)
+    # Wait for CSV to stabilize before reading
+    if not wait_for_file_stability(settings):
+        logger.error("CSV file did not stabilize, cycle aborted")
+        logger.info("=" * 80)
+        return
+
+    total_rows, df = stream_stocks_chunks(settings)
 
     if df.empty:
         logger.warning("No stock data available after streaming, cycle skipped")
@@ -138,7 +228,7 @@ async def run_sync_cycle(settings: Settings, mapper: ProductMapper) -> None:
         return
 
     try:
-        mapping: MappingResult = mapper.map_dataframe(df)
+        mapping = mapper.map_dataframe(df)
     except MappingError:
         logger.exception("Mapping failed, cycle aborted")
         logger.info("=" * 80)
@@ -157,7 +247,10 @@ async def run_sync_cycle(settings: Settings, mapper: ProductMapper) -> None:
     tasks: list[asyncio.Task[Any]] = []
     labels: list[str] = []
 
-    async with WildberriesClient(settings) as wb_client, OzonClient(settings) as ozon_client:
+    wb_client = WildberriesClient(settings, session)
+    ozon_client = OzonClient(settings, session)
+
+    try:
         # --- Wildberries ------------------------------------------------
         if settings.enable_wb and mapping.wb_items:
             tasks.append(asyncio.create_task(wb_client.update_stocks(mapping.wb_items)))
@@ -179,14 +272,24 @@ async def run_sync_cycle(settings: Settings, mapper: ProductMapper) -> None:
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    for label, result in zip(labels, results):
-        if isinstance(result, BaseException):
-            logger.error("[%s] Pipeline crashed: %s", label.upper(), result)
-        else:
-            logger.info("[RESULT] %s", result.as_line())
+        for label, result in zip(labels, results):
+            if isinstance(result, CriticalAPIError):
+                # Re-raise to stop the scheduler
+                logger.critical(
+                    "[%s] CRITICAL API ERROR: HTTP %d - %s",
+                    label.upper(),
+                    result.status_code,
+                    result.message,
+                )
+                raise result
+            elif isinstance(result, BaseException):
+                logger.error("[%s] Pipeline crashed: %s", label.upper(), result)
+            else:
+                logger.info("[RESULT] %s", result.as_line())
 
-    logger.info("SYNC CYCLE FINISHED | total_csv_rows=%d", total_rows)
-    logger.info("=" * 80)
+    finally:
+        logger.info("SYNC CYCLE FINISHED | total_csv_rows=%d", total_rows)
+        logger.info("=" * 80)
 
 
 # ----------------------------------------------------------------------
@@ -197,13 +300,14 @@ async def main() -> None:
     settings = get_settings()
     setup_logging(settings)
 
-    logger.info("Multi-marketplace Stock Sync v2.0 (streaming-optimized)")
+    logger.info("Multi-marketplace Stock Sync v2.1 (streaming-optimized, hardened)")
     logger.info(
-        "Marketplaces: WB=%s, Ozon=%s | interval=%d min | batch=%d | stream_chunk=10k",
+        "Marketplaces: WB=%s, Ozon=%s | interval=%d min | batch=%d | stream_chunk=%d",
         settings.enable_wb,
         settings.enable_ozon,
         settings.sync_interval_minutes,
         settings.batch_size,
+        settings.stream_chunk_size,
     )
 
     try:
@@ -215,15 +319,32 @@ async def main() -> None:
         logger.exception("Cannot start without a valid mapping file")
         return
 
-    scheduler = SyncScheduler(settings, job=lambda: run_sync_cycle(settings, mapper))
+    # Create a single shared session for the entire daemon lifetime
+    timeout = aiohttp.ClientTimeout(total=settings.request_timeout)
+    connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
+    session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+
+    scheduler = SyncScheduler(
+        settings,
+        job=lambda: run_sync_cycle(settings, mapper, session),
+    )
     scheduler.start()
     _install_signal_handlers(scheduler)
 
     if settings.run_on_startup:
-        await run_sync_cycle(settings, mapper)
+        try:
+            await run_sync_cycle(settings, mapper, session)
+        except CriticalAPIError as exc:
+            logger.critical("STARTUP SYNC FAILED WITH CRITICAL ERROR: %s", exc)
+            await session.close()
+            scheduler.shutdown()
+            return
 
     logger.info("Daemon is running. Press Ctrl+C to stop.")
-    await scheduler.run_forever()
+    try:
+        await scheduler.run_forever()
+    finally:
+        await session.close()
 
 
 def _install_signal_handlers(scheduler: SyncScheduler) -> None:

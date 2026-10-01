@@ -8,14 +8,12 @@ from typing import Any, Iterable, Optional
 
 import pandas as pd
 
+from exceptions import MappingError
+
 logger = logging.getLogger(__name__)
 
 SKU_COLUMN = "item_sku"
 QTY_COLUMN = "quantity"
-
-
-class MappingError(Exception):
-    """Raised when the mapping file is missing, malformed or inconsistent."""
 
 
 # ----------------------------------------------------------------------
