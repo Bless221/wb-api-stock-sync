@@ -1,0 +1,300 @@
+"""Asynchronous Ozon Seller API client.
+
+Mirrors :mod:`wb_client` but is fully independent: it owns its own
+``aiohttp`` session, its own batching and — most importantly — its own
+exponential backoff state, so throttling on Ozon has zero effect on the
+Wildberries pipeline running in the same event loop.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import random
+import time
+from dataclasses import dataclass, field
+from types import TracebackType
+from typing import Any, Optional, Sequence
+
+import aiohttp
+
+from config import Settings
+from mapper import OzonStockItem
+
+logger = logging.getLogger(__name__)
+
+RETRYABLE_STATUSES: frozenset[int] = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+@dataclass(slots=True)
+class OzonSyncReport:
+    """Aggregated outcome of one Ozon synchronisation run."""
+
+    marketplace: str = "ozon"
+    total_items: int = 0
+    sent_items: int = 0
+    rejected_items: int = 0
+    failed_items: int = 0
+    batches_total: int = 0
+    batches_ok: int = 0
+    batches_failed: int = 0
+    rate_limit_hits: int = 0
+    duration_seconds: float = 0.0
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def success(self) -> bool:
+        """``True`` when no batch failed and no item was rejected."""
+        return self.batches_failed == 0 and self.rejected_items == 0 and not self.errors
+
+    def as_line(self) -> str:
+        """Compact representation for log output."""
+        status = "OK" if self.success else "PARTIAL/FAIL"
+        return (
+            f"[OZON] {status}: updated={self.sent_items}/{self.total_items}, "
+            f"rejected={self.rejected_items}, batches={self.batches_ok}/{self.batches_total}, "
+            f"429_hits={self.rate_limit_hits}, time={self.duration_seconds:.2f}s"
+        )
+
+
+class OzonClient:
+    """Async client for ``POST /v1/product/import/stocks``."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        session: Optional[aiohttp.ClientSession] = None,
+    ) -> None:
+        self._settings = settings
+        self._session = session
+        self._owns_session = session is None
+
+        self._batch_size = settings.batch_size
+        self._base_delay = settings.ozon_request_delay
+        self._backoff_base = settings.ozon_backoff_base
+        self._backoff_max = settings.ozon_backoff_max
+        self._max_retries = settings.ozon_max_retries
+
+        # Isolated rate-limit shield state (Ozon only).
+        self._cooldown_until: float = 0.0
+        self._state_lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Context manager
+    # ------------------------------------------------------------------
+    async def __aenter__(self) -> "OzonClient":
+        await self._ensure_session()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType],
+    ) -> None:
+        await self.close()
+
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        """Create the ``aiohttp`` session lazily if it was not injected."""
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=self._settings.request_timeout)
+            connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+            self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+            self._owns_session = True
+        return self._session
+
+    async def close(self) -> None:
+        """Close the session if this client owns it."""
+        if self._owns_session and self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    async def update_stocks(self, items: Sequence[OzonStockItem]) -> OzonSyncReport:
+        """Push stock levels to Ozon in batches of 100 items."""
+        started = time.monotonic()
+        report = OzonSyncReport(total_items=len(items))
+
+        if not items:
+            logger.info("[OZON] Nothing to sync: empty item list")
+            report.duration_seconds = time.monotonic() - started
+            return report
+
+        await self._ensure_session()
+        batches = list(self._chunk(items, self._batch_size))
+        report.batches_total = len(batches)
+        logger.info("[OZON] Starting sync: %d items in %d batches", len(items), len(batches))
+
+        for number, batch in enumerate(batches, start=1):
+            try:
+                body = await self._send_batch(batch, number, report)
+                self._collect_item_results(body, number, report)
+                report.batches_ok += 1
+            except Exception as exc:  # noqa: BLE001 - one batch must not kill the run
+                report.batches_failed += 1
+                report.failed_items += len(batch)
+                message = f"batch {number}: {exc}"
+                report.errors.append(message)
+                logger.error("[OZON] Batch %d failed: %s", number, exc)
+
+            if number < len(batches) and self._base_delay > 0:
+                await asyncio.sleep(self._base_delay)
+
+        report.duration_seconds = time.monotonic() - started
+        logger.info(report.as_line())
+        return report
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _chunk(items: Sequence[OzonStockItem], size: int) -> list[Sequence[OzonStockItem]]:
+        """Split a sequence into consecutive chunks of ``size`` elements."""
+        return [items[index : index + size] for index in range(0, len(items), size)]
+
+    async def _send_batch(
+        self,
+        batch: Sequence[OzonStockItem],
+        number: int,
+        report: OzonSyncReport,
+    ) -> dict[str, Any]:
+        """Send a single batch with an isolated exponential backoff retry loop."""
+        payload: dict[str, Any] = {"stocks": [item.to_payload() for item in batch]}
+        url = self._settings.ozon_stocks_url
+        headers = self._settings.ozon_headers()
+        attempt = 0
+
+        while True:
+            await self._await_cooldown()
+            session = await self._ensure_session()
+
+            try:
+                async with session.post(url, json=payload, headers=headers) as response:
+                    status = response.status
+                    text = await response.text()
+
+                    if status == 200:
+                        await self._relax_cooldown()
+                        return self._parse_json(text)
+
+                    if status == 429:
+                        report.rate_limit_hits += 1
+
+                    if status in RETRYABLE_STATUSES and attempt < self._max_retries:
+                        delay = await self._register_failure(
+                            attempt, self._retry_after(response)
+                        )
+                        logger.warning(
+                            "[OZON] Batch %d got HTTP %d, retry %d/%d in %.1fs",
+                            number,
+                            status,
+                            attempt + 1,
+                            self._max_retries,
+                            delay,
+                        )
+                        attempt += 1
+                        await asyncio.sleep(delay)
+                        continue
+
+                    raise RuntimeError(f"HTTP {status}: {self._trim(text)}")
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt >= self._max_retries:
+                    raise RuntimeError(f"network error: {exc}") from exc
+                delay = await self._register_failure(attempt, None)
+                logger.warning(
+                    "[OZON] Batch %d network error (%s), retry %d/%d in %.1fs",
+                    number,
+                    exc,
+                    attempt + 1,
+                    self._max_retries,
+                    delay,
+                )
+                attempt += 1
+                await asyncio.sleep(delay)
+
+    @staticmethod
+    def _collect_item_results(
+        body: dict[str, Any],
+        number: int,
+        report: OzonSyncReport,
+    ) -> None:
+        """Inspect per-item results returned by Ozon and update the report."""
+        results = body.get("result") or []
+        if not isinstance(results, list):
+            logger.warning("[OZON] Batch %d: unexpected response shape", number)
+            return
+
+        for entry in results:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("updated") is True:
+                report.sent_items += 1
+                continue
+
+            report.rejected_items += 1
+            offer_id = entry.get("offer_id", "<unknown>")
+            errors = entry.get("errors") or []
+            details = "; ".join(
+                str(error.get("message") or error.get("code") or error)
+                for error in errors
+                if isinstance(error, (dict, str))
+            )
+            message = f"offer_id={offer_id}: {details or 'rejected without details'}"
+            report.errors.append(message)
+            logger.warning("[OZON] Batch %d rejected item %s", number, message)
+
+    async def _register_failure(self, attempt: int, retry_after: Optional[float]) -> float:
+        """Compute the next backoff delay and arm the Ozon-only cooldown window."""
+        delay = self._backoff_base * (2**attempt)
+        delay = min(delay, self._backoff_max)
+        if retry_after is not None:
+            delay = max(delay, min(retry_after, self._backoff_max))
+        delay += random.uniform(0.0, min(1.0, delay * 0.1))  # jitter
+
+        async with self._state_lock:
+            self._cooldown_until = max(self._cooldown_until, time.monotonic() + delay)
+        return delay
+
+    async def _relax_cooldown(self) -> None:
+        """Drop the cooldown window after a successful call."""
+        async with self._state_lock:
+            self._cooldown_until = 0.0
+
+    async def _await_cooldown(self) -> None:
+        """Sleep until the client-local cooldown window expires."""
+        async with self._state_lock:
+            remaining = self._cooldown_until - time.monotonic()
+        if remaining > 0:
+            logger.debug("[OZON] Cooling down for %.1fs", remaining)
+            await asyncio.sleep(remaining)
+
+    @staticmethod
+    def _retry_after(response: aiohttp.ClientResponse) -> Optional[float]:
+        """Parse the ``Retry-After`` header when the server provides one."""
+        raw = response.headers.get("Retry-After")
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _parse_json(text: str) -> dict[str, Any]:
+        """Safely decode a JSON response body."""
+        import json
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"invalid JSON response: {exc}") from exc
+        return data if isinstance(data, dict) else {"result": data}
+
+    @staticmethod
+    def _trim(text: str, limit: int = 500) -> str:
+        """Shorten a response body for safe logging."""
+        text = " ".join(text.split())
+        return text if len(text) <= limit else f"{text[:limit]}..."
