@@ -1,15 +1,3 @@
-"""Entry point of the multi-marketplace stock synchroniser (v2.0).
-
-Pipeline:
-
-1. stream ``stocks.csv`` in chunks using csv.DictReader (O(1) memory);
-2. per-chunk: deduplicate by ``item_sku``, translate to marketplace payloads;
-3. aggregate results, then fire both clients concurrently via ``asyncio.gather``;
-4. repeat every N minutes through a non-blocking ``AsyncIOScheduler``.
-
-Streaming approach prevents OOM on 500k+ row files.
-"""
-
 from __future__ import annotations
 
 import asyncio

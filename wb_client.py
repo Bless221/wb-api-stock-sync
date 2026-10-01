@@ -1,17 +1,3 @@
-"""Asynchronous Wildberries Marketplace API v3 client with concurrent batches.
-
-Responsibilities:
-
-* chunk the payload into batches of ``BATCH_SIZE`` (100) items;
-* fire multiple batches **concurrently** (not sequentially) via asyncio.gather
-  with a semaphore to respect rate limits;
-* talk to ``PUT /api/v3/stocks/{warehouseId}`` over ``aiohttp``;
-* own an **isolated** exponential backoff state.
-
-Concurrency model: if one batch gets 429, only that task backs off.
-Other batches continue. Max concurrent batches is tunable via CONCURRENCY.
-"""
-
 from __future__ import annotations
 
 import asyncio

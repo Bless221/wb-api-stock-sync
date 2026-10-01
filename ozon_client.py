@@ -1,9 +1,3 @@
-"""Asynchronous Ozon Seller API client with concurrent batch dispatch.
-
-Mirrors :mod:`wb_client` but fully independent: owns its own session,
-batching, backoff state, and Semaphore. Multiple batches fire concurrently.
-"""
-
 from __future__ import annotations
 
 import asyncio
