@@ -127,7 +127,7 @@ async def get_all_products(database_path: Path) -> dict[str, dict[str, Any]]:
     try:
         async with aiosqlite.connect(database_path) as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM products WHERE active = 1")
+            cursor = await db.execute("SELECT * FROM products")
             rows = await cursor.fetchall()
 
             for row in rows:
@@ -144,7 +144,9 @@ async def get_all_products(database_path: Path) -> dict[str, dict[str, Any]]:
         logger.exception("Failed to load products from database")
         raise DatabaseError(f"Failed to load products: {exc}") from exc
 
-    logger.debug("Loaded %d active products from database", len(result))
+    logger.debug("Loaded %d products from database for caching", len(result))
+    return result
+
     return result
 
 
