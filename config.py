@@ -71,58 +71,27 @@ class Settings(BaseSettings):
     run_on_startup: bool = Field(default=True)
 
     # ------------------------------------------------------------------
-    # File stability checking (защита от недописанных файлов из 1С)
+    # File stability checking
     # ------------------------------------------------------------------
-    csv_wait_timeout: int = Field(
-        default=10,
-        ge=1,
-        le=300,
-        description="Maximum seconds to wait for CSV file to stabilize",
-    )
-    csv_stability_window: int = Field(
-        default=2,
-        ge=1,
-        le=10,
-        description="Consecutive seconds size must be unchanged to consider file stable",
-    )
-    csv_check_interval: float = Field(
-        default=1.0,
-        ge=0.1,
-        le=5.0,
-        description="Interval in seconds between file size checks",
-    )
+    csv_wait_timeout: int = Field(default=10, ge=1, le=300)
+    csv_stability_window: int = Field(default=2, ge=1, le=10)
+    csv_check_interval: float = Field(default=1.0, ge=0.1, le=5.0)
 
     # ------------------------------------------------------------------
-    # Streaming chunk size (защита от OOM при загрузке больших CSV)
+    # Streaming chunk size
     # ------------------------------------------------------------------
-    csv_chunk_size: int = Field(
-        default=10000,
-        ge=1000,
-        le=100000,
-        description="Rows per chunk when streaming CSV to prevent OOM",
-    )
+    csv_chunk_size: int = Field(default=10000, ge=1000, le=100000)
 
     # ------------------------------------------------------------------
     # Parallel batch settings
     # ------------------------------------------------------------------
-    max_concurrent_batches: int = Field(
-        default=3,
-        ge=1,
-        le=10,
-        description="Maximum number of concurrent batch uploads per marketplace",
-    )
+    max_concurrent_batches: int = Field(default=3, ge=1, le=10)
 
     # ------------------------------------------------------------------
     # Notifications (Telegram)
     # ------------------------------------------------------------------
-    telegram_bot_token: Optional[SecretStr] = Field(
-        default=None,
-        description="Telegram bot token for notifications",
-    )
-    telegram_chat_id: Optional[str] = Field(
-        default=None,
-        description="Telegram chat ID for notifications",
-    )
+    telegram_bot_token: Optional[SecretStr] = Field(default=None)
+    telegram_chat_id: Optional[str] = Field(default=None)
 
     # ------------------------------------------------------------------
     # Logging
@@ -136,7 +105,6 @@ class Settings(BaseSettings):
     @field_validator("wb_base_url", "ozon_base_url")
     @classmethod
     def _strip_trailing_slash(cls, value: str) -> str:
-        """Normalise base URLs so path concatenation is always predictable."""
         value = value.strip().rstrip("/")
         if not value.startswith(("http://", "https://")):
             raise ValueError("Base URL must start with http:// or https://")
@@ -154,7 +122,6 @@ class Settings(BaseSettings):
     @field_validator("csv_path", "mapping_path", "log_file", "database_path")
     @classmethod
     def _resolve_path(cls, value: Path) -> Path:
-        """Resolve relative paths against the project root."""
         return value if value.is_absolute() else (BASE_DIR / value)
 
     @field_validator("wb_api_token", "ozon_api_key", "ozon_client_id")
@@ -162,13 +129,6 @@ class Settings(BaseSettings):
     def _reject_empty_secret(cls, value: SecretStr) -> SecretStr:
         if not value.get_secret_value().strip():
             raise ValueError("Credential must not be empty")
-        return value
-
-    @field_validator("telegram_bot_token")
-    @classmethod
-    def _validate_telegram_token(cls, value: Optional[SecretStr]) -> Optional[SecretStr]:
-        if value is not None and not value.get_secret_value().strip():
-            raise ValueError("Telegram token must not be empty if provided")
         return value
 
     @model_validator(mode="after")
@@ -179,14 +139,15 @@ class Settings(BaseSettings):
             raise ValueError("OZON_BACKOFF_MAX must be >= OZON_BACKOFF_BASE")
         if not (self.enable_wb or self.enable_ozon):
             raise ValueError("At least one marketplace must be enabled")
+        if self.telegram_bot_token and not self.telegram_bot_token.get_secret_value().strip():
+            self.telegram_bot_token = None
+        if self.telegram_chat_id and not self.telegram_chat_id.strip():
+            self.telegram_chat_id = None
 
-        # Telegram validation: both token and chat_id must be provided together
         has_token = self.telegram_bot_token is not None
         has_chat_id = self.telegram_chat_id is not None
         if has_token != has_chat_id:
-            raise ValueError(
-                "Both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be provided together"
-            )
+            raise ValueError("Both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be provided together")
 
         return self
 
@@ -195,57 +156,14 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     @property
     def wb_stocks_url(self) -> str:
-        """Full URL of the WB v3 stocks endpoint for the configured warehouse."""
         return f"{self.wb_base_url}/api/v3/stocks/{self.wb_warehouse_id}"
 
     @property
     def ozon_stocks_url(self) -> str:
-        """Full URL of the Ozon stocks import endpoint."""
         return f"{self.ozon_base_url}/v1/product/import/stocks"
 
-    @property
-    def telegram_enabled(self) -> bool:
-        """Check if Telegram notifications are configured."""
-        return self.telegram_bot_token is not None and self.telegram_chat_id is not None
 
-    def wb_headers(self) -> dict[str, str]:
-        """Authorization headers for Wildberries.
-
-        IMPORTANT: Tokens are extracted via .get_secret_value() to avoid
-        sending the masked "SecretStr(***)" string instead of the real token.
-        """
-        return {
-            "Authorization": self.wb_api_token.get_secret_value(),
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-
-    def ozon_headers(self) -> dict[str, str]:
-        """Authorization headers for Ozon.
-
-        IMPORTANT: Tokens are extracted via .get_secret_value() to avoid
-        sending the masked "SecretStr(***)" string instead of the real token.
-        """
-        return {
-            "Client-Id": self.ozon_client_id.get_secret_value(),
-            "Api-Key": self.ozon_api_key.get_secret_value(),
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-
-    def telegram_token_str(self) -> Optional[str]:
-        """Get Telegram token as plain string for API calls."""
-        return (
-            self.telegram_bot_token.get_secret_value()
-            if self.telegram_bot_token
-            else None
-        )
-
-
-@lru_cache(maxsize=1)
+@lru_cache()
 def get_settings() -> Settings:
-    """Return a cached singleton of validated settings."""
+    """Возвращает кэшированный синглтон настроек приложения."""
     return Settings()
-
-
-settings: Settings = get_settings()
