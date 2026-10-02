@@ -47,7 +47,6 @@ logs/
 backups/
 *.db
 stocks.csv
-mapping.json
 mapping.json.bak
 
 # System
@@ -55,5 +54,4 @@ mapping.json.bak
 Thumbs.db
 
 # Docker
-.dockerignore
 docker-compose.override.yml
