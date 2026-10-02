@@ -13,21 +13,12 @@ import aiohttp
 
 from config import Settings
 from mapper import WBStockItem
+from exceptions import CriticalAPIError
 
 logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUSES: frozenset[int] = frozenset({408, 425, 429, 500, 502, 503, 504})
 CRITICAL_STATUSES: frozenset[int] = frozenset({401, 403, 400})
-
-
-class CriticalAPIError(Exception):
-    def __init__(self, marketplace: str, status_code: int, message: str) -> None:
-        self.marketplace = marketplace
-        self.status_code = status_code
-        self.message = message
-        super().__init__(
-            f"[{marketplace.upper()}] Critical API error (HTTP {status_code}): {message}"
-        )
 
 
 @dataclass(slots=True)
@@ -68,6 +59,7 @@ class WildberriesClient:
         self._backoff_max = settings.wb_backoff_max
         self._max_retries = settings.wb_max_retries
         self._max_concurrent_batches = settings.max_concurrent_batches
+
         self._cooldown_until: float = 0.0
         self._state_lock = asyncio.Lock()
         self._batch_semaphore = asyncio.Semaphore(self._max_concurrent_batches)
@@ -182,9 +174,6 @@ class WildberriesClient:
                 attempt += 1
                 await asyncio.sleep(delay)
 
-    # ------------------------------------------------------------------
-    # Атомарное управление защитным щитом лимитов (Rate Limit Shield)
-    # ------------------------------------------------------------------
     async def _await_cooldown(self) -> None:
         while True:
             now = time.monotonic()
@@ -200,7 +189,7 @@ class WildberriesClient:
                 delay = retry_after
             else:
                 delay = min(self._backoff_max, self._backoff_base * (2 ** attempt))
-                delay += random.uniform(0, 0.5 * delay)  # Jitter
+                delay += random.uniform(0, 0.5 * delay)
             
             self._cooldown_until = time.monotonic() + delay
             return delay
