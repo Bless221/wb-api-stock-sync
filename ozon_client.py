@@ -13,21 +13,12 @@ import aiohttp
 
 from config import Settings
 from mapper import OzonStockItem
+from exceptions import CriticalAPIError
 
 logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUSES: frozenset[int] = frozenset({408, 425, 429, 500, 502, 503, 504})
 CRITICAL_STATUSES: frozenset[int] = frozenset({401, 403, 400})
-
-
-class CriticalAPIError(Exception):
-    def __init__(self, marketplace: str, status_code: int, message: str) -> None:
-        self.marketplace = marketplace
-        self.status_code = status_code
-        self.message = message
-        super().__init__(
-            f"[{marketplace.upper()}] Critical API error (HTTP {status_code}): {message}"
-        )
 
 
 @dataclass(slots=True)
@@ -61,7 +52,7 @@ class OzonClient:
 
     def __init__(self, settings: Settings, session: aiohttp.ClientSession) -> None:
         self._settings = settings
-        self._session = session  # Переиспользуем внешнюю сессию из main.py
+        self._session = session
 
         self._batch_size = settings.batch_size
         self._base_delay = settings.ozon_request_delay
@@ -69,6 +60,7 @@ class OzonClient:
         self._backoff_max = settings.ozon_backoff_max
         self._max_retries = settings.ozon_max_retries
         self._max_concurrent_batches = settings.max_concurrent_batches
+
         self._cooldown_until: float = 0.0
         self._state_lock = asyncio.Lock()
         self._batch_semaphore = asyncio.Semaphore(self._max_concurrent_batches)
@@ -183,9 +175,6 @@ class OzonClient:
                 attempt += 1
                 await asyncio.sleep(delay)
 
-    # ------------------------------------------------------------------
-    # Атомарный Rate Limit Shield
-    # ------------------------------------------------------------------
     async def _await_cooldown(self) -> None:
         while True:
             now = time.monotonic()
@@ -209,9 +198,6 @@ class OzonClient:
         async with self._state_lock:
             self._cooldown_until = time.monotonic() + self._base_delay
 
-    # ------------------------------------------------------------------
-    # Парсинг поштучных ответов Ozon
-    # ------------------------------------------------------------------
     def _collect_item_results(self, response_data: dict[str, Any], batch_number: int, report: OzonSyncReport) -> None:
         results = response_data.get("result", [])
         if not results:
@@ -227,7 +213,7 @@ class OzonClient:
             else:
                 batch_rejected += 1
                 errors = item.get("errors", [])
-                err_msg = errors[0].get("message", "Unknown error") if errors else "Rejected"
+                err_msg = errors.get("message", "Unknown error") if errors else "Rejected"
                 logger.warning("[OZON] SKU %s rejected: %s", item.get("offer_id"), err_msg)
 
         report.sent_items += batch_sent
@@ -259,3 +245,8 @@ class OzonClient:
     def _parse_error_body(body: str) -> str:
         try:
             data = json.loads(body)
+            if isinstance(data, dict):
+                return data.get("message", body[:200])
+        except Exception:
+            pass
+        return body[:200]
