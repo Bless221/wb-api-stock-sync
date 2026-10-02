@@ -21,11 +21,6 @@ CRITICAL_STATUSES: frozenset[int] = frozenset({401, 403})
 
 
 class CriticalAPIError(Exception):
-    """Raised when API returns a critical, non-recoverable error (401, 403).
-
-    When caught at the scheduler level, triggers immediate shutdown to prevent
-    spam and wasted retry cycles.
-    """
 
     def __init__(self, marketplace: str, status_code: int, message: str) -> None:
         self.marketplace = marketplace
@@ -38,7 +33,6 @@ class CriticalAPIError(Exception):
 
 @dataclass(slots=True)
 class OzonSyncReport:
-    """Aggregated outcome of one Ozon synchronisation run."""
 
     marketplace: str = "ozon"
     total_items: int = 0
@@ -54,11 +48,9 @@ class OzonSyncReport:
 
     @property
     def success(self) -> bool:
-        """``True`` when no batch failed and no item was rejected."""
         return self.batches_failed == 0 and self.rejected_items == 0 and not self.errors
 
     def as_line(self) -> str:
-        """Compact representation for log output."""
         status = "OK" if self.success else "PARTIAL/FAIL"
         return (
             f"[OZON] {status}: updated={self.sent_items}/{self.total_items}, "
@@ -68,14 +60,6 @@ class OzonSyncReport:
 
 
 class OzonClient:
-    """Async client for ``POST /v1/product/import/stocks`` with parallel batches.
-
-    Key improvements:
-    - Batches are sent in parallel via asyncio.gather (up to max_concurrent_batches)
-    - Semaphore limits concurrent requests to prevent overwhelming the server
-    - Critical errors (401, 403) trigger CriticalAPIError for scheduler shutdown
-    - SecretStr tokens are properly extracted via .get_secret_value()
-    """
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -112,7 +96,6 @@ class OzonClient:
         await self.close()
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
-        """Create the ``aiohttp`` session lazily if needed."""
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=self._settings.request_timeout)
             connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
@@ -121,7 +104,6 @@ class OzonClient:
         return self._session
 
     async def close(self) -> None:
-        """Close the session if this client owns it."""
         if self._owns_session and self._session and not self._session.closed:
             await self._session.close()
             self._session = None
@@ -130,13 +112,6 @@ class OzonClient:
     # Public API
     # ------------------------------------------------------------------
     async def update_stocks(self, items: Sequence[OzonStockItem]) -> OzonSyncReport:
-        """Push stock levels to Ozon in parallel batches of batch_size items.
-
-        Launches up to max_concurrent_batches tasks simultaneously via asyncio.gather.
-
-        Raises:
-            CriticalAPIError: When API returns 401 or 403 status codes.
-        """
         started = time.monotonic()
         report = OzonSyncReport(total_items=len(items))
 
@@ -173,7 +148,6 @@ class OzonClient:
     # ------------------------------------------------------------------
     @staticmethod
     def _chunk(items: Sequence[OzonStockItem], size: int) -> list[Sequence[OzonStockItem]]:
-        """Split a sequence into consecutive chunks of ``size`` elements."""
         return [items[index: index + size] for index in range(0, len(items), size)]
 
     async def _send_batch_guarded(
@@ -182,11 +156,6 @@ class OzonClient:
             number: int,
             report: OzonSyncReport,
     ) -> None:
-        """Acquire semaphore, then send a batch with isolated exponential backoff.
-
-        Raises:
-            CriticalAPIError: Re-raised from _send_batch to stop the scheduler.
-        """
         async with self._batch_semaphore:
             try:
                 body = await self._send_batch(batch, number, report)
@@ -208,11 +177,6 @@ class OzonClient:
             number: int,
             report: OzonSyncReport,
     ) -> dict[str, Any]:
-        """Send a single batch with isolated exponential backoff retry loop.
-
-        Raises:
-            CriticalAPIError: On 401 or 403 status codes.
-        """
         payload: dict[str, Any] = {"stocks": [item.to_payload() for item in batch]}
         url = self._settings.ozon_stocks_url
         headers = self._settings.ozon_headers()  # Tokens properly extracted here
@@ -281,7 +245,6 @@ class OzonClient:
             number: int,
             report: OzonSyncReport,
     ) -> None:
-        """Inspect per-item results returned by Ozon and update the report."""
         results = body.get("result") or []
         if not isinstance(results, list):
             logger.warning("[OZON] Batch %d: unexpected response shape", number)
@@ -314,7 +277,6 @@ class OzonClient:
             logger.warning("[OZON] Batch %d rejected item: %s", number, message)
 
     async def _register_failure(self, attempt: int, retry_after: Optional[float]) -> float:
-        """Compute the next backoff delay and arm the Ozon-only cooldown window."""
         delay = self._backoff_base * (2 ** attempt)
         delay = min(delay, self._backoff_max)
         if retry_after is not None:
@@ -326,12 +288,10 @@ class OzonClient:
         return delay
 
     async def _relax_cooldown(self) -> None:
-        """Drop the cooldown window after a successful call."""
         async with self._state_lock:
             self._cooldown_until = 0.0
 
     async def _await_cooldown(self) -> None:
-        """Sleep until the client-local cooldown window expires."""
         async with self._state_lock:
             remaining = self._cooldown_until - time.monotonic()
         if remaining > 0:
@@ -340,7 +300,6 @@ class OzonClient:
 
     @staticmethod
     def _retry_after(response: aiohttp.ClientResponse) -> Optional[float]:
-        """Parse the ``Retry-After`` header when the server provides one."""
         raw = response.headers.get("Retry-After")
         if not raw:
             return None
@@ -351,7 +310,6 @@ class OzonClient:
 
     @staticmethod
     def _parse_json(text: str) -> dict[str, Any]:
-        """Safely decode a JSON response body."""
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
@@ -360,7 +318,6 @@ class OzonClient:
 
     @staticmethod
     def _parse_error_body(text: str) -> str:
-        """Parse and clean error response body (JSON or plain text)."""
         text = text.strip()
         if not text:
             return "<empty response>"

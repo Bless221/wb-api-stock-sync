@@ -11,7 +11,6 @@ BASE_DIR: Path = Path(__file__).resolve().parent
 
 
 class Settings(BaseSettings):
-    """Runtime configuration loaded from environment variables and ``.env``."""
 
     model_config = SettingsConfigDict(
         env_file=BASE_DIR / ".env",
@@ -46,6 +45,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     csv_path: Path = Field(default=Path("stocks.csv"))
     mapping_path: Path = Field(default=Path("mapping.json"))
+    database_path: Path = Field(default=Path("data/stocks.db"))
 
     # ------------------------------------------------------------------
     # Batching and rate limits
@@ -113,10 +113,22 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # Notifications (Telegram)
+    # ------------------------------------------------------------------
+    telegram_bot_token: Optional[SecretStr] = Field(
+        default=None,
+        description="Telegram bot token for notifications",
+    )
+    telegram_chat_id: Optional[str] = Field(
+        default=None,
+        description="Telegram chat ID for notifications",
+    )
+
+    # ------------------------------------------------------------------
     # Logging
     # ------------------------------------------------------------------
     log_level: str = Field(default="INFO")
-    log_file: Path = Field(default=Path("sync.log"))
+    log_file: Path = Field(default=Path("logs/sync.log"))
 
     # ------------------------------------------------------------------
     # Validators
@@ -139,7 +151,7 @@ class Settings(BaseSettings):
             raise ValueError(f"LOG_LEVEL must be one of {sorted(allowed)}")
         return normalized
 
-    @field_validator("csv_path", "mapping_path", "log_file")
+    @field_validator("csv_path", "mapping_path", "log_file", "database_path")
     @classmethod
     def _resolve_path(cls, value: Path) -> Path:
         """Resolve relative paths against the project root."""
@@ -152,6 +164,13 @@ class Settings(BaseSettings):
             raise ValueError("Credential must not be empty")
         return value
 
+    @field_validator("telegram_bot_token")
+    @classmethod
+    def _validate_telegram_token(cls, value: Optional[SecretStr]) -> Optional[SecretStr]:
+        if value is not None and not value.get_secret_value().strip():
+            raise ValueError("Telegram token must not be empty if provided")
+        return value
+
     @model_validator(mode="after")
     def _validate_backoff_bounds(self) -> "Settings":
         if self.wb_backoff_max < self.wb_backoff_base:
@@ -160,6 +179,15 @@ class Settings(BaseSettings):
             raise ValueError("OZON_BACKOFF_MAX must be >= OZON_BACKOFF_BASE")
         if not (self.enable_wb or self.enable_ozon):
             raise ValueError("At least one marketplace must be enabled")
+
+        # Telegram validation: both token and chat_id must be provided together
+        has_token = self.telegram_bot_token is not None
+        has_chat_id = self.telegram_chat_id is not None
+        if has_token != has_chat_id:
+            raise ValueError(
+                "Both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be provided together"
+            )
+
         return self
 
     # ------------------------------------------------------------------
@@ -174,6 +202,11 @@ class Settings(BaseSettings):
     def ozon_stocks_url(self) -> str:
         """Full URL of the Ozon stocks import endpoint."""
         return f"{self.ozon_base_url}/v1/product/import/stocks"
+
+    @property
+    def telegram_enabled(self) -> bool:
+        """Check if Telegram notifications are configured."""
+        return self.telegram_bot_token is not None and self.telegram_chat_id is not None
 
     def wb_headers(self) -> dict[str, str]:
         """Authorization headers for Wildberries.
@@ -199,6 +232,14 @@ class Settings(BaseSettings):
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+
+    def telegram_token_str(self) -> Optional[str]:
+        """Get Telegram token as plain string for API calls."""
+        return (
+            self.telegram_bot_token.get_secret_value()
+            if self.telegram_bot_token
+            else None
+        )
 
 
 @lru_cache(maxsize=1)

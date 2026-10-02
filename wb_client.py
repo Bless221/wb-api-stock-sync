@@ -21,12 +21,6 @@ CRITICAL_STATUSES: frozenset[int] = frozenset({401, 403})
 
 
 class CriticalAPIError(Exception):
-    """Raised when API returns a critical, non-recoverable error (401, 403).
-
-    When caught at the scheduler level, triggers immediate shutdown to prevent
-    spam and wasted retry cycles.
-    """
-
     def __init__(self, marketplace: str, status_code: int, message: str) -> None:
         self.marketplace = marketplace
         self.status_code = status_code
@@ -38,7 +32,6 @@ class CriticalAPIError(Exception):
 
 @dataclass(slots=True)
 class WBSyncReport:
-    """Aggregated outcome of one Wildberries synchronisation run."""
 
     marketplace: str = "wildberries"
     total_items: int = 0
@@ -53,11 +46,9 @@ class WBSyncReport:
 
     @property
     def success(self) -> bool:
-        """``True`` when every batch has been accepted by the marketplace."""
         return self.batches_failed == 0 and not self.errors
 
     def as_line(self) -> str:
-        """Compact representation for log output."""
         status = "OK" if self.success else "PARTIAL/FAIL"
         return (
             f"[WB] {status}: sent={self.sent_items}/{self.total_items}, "
@@ -67,14 +58,6 @@ class WBSyncReport:
 
 
 class WildberriesClient:
-    """Async client for the Wildberries stocks endpoint (API v3) with parallel batch dispatch.
-
-    Key improvements:
-    - Batches are sent in parallel via asyncio.gather (up to max_concurrent_batches)
-    - Semaphore limits concurrent requests to prevent overwhelming the server
-    - Critical errors (401, 403) trigger CriticalAPIError for scheduler shutdown
-    - SecretStr tokens are properly extracted via .get_secret_value()
-    """
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -111,7 +94,6 @@ class WildberriesClient:
         await self.close()
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
-        """Create the ``aiohttp`` session lazily if needed."""
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=self._settings.request_timeout)
             connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
@@ -120,7 +102,6 @@ class WildberriesClient:
         return self._session
 
     async def close(self) -> None:
-        """Close the session if this client owns it."""
         if self._owns_session and self._session and not self._session.closed:
             await self._session.close()
             self._session = None
@@ -129,14 +110,6 @@ class WildberriesClient:
     # Public API
     # ------------------------------------------------------------------
     async def update_stocks(self, items: Sequence[WBStockItem]) -> WBSyncReport:
-        """Push stock levels to Wildberries in parallel batches of batch_size items.
-
-        Launches up to max_concurrent_batches tasks simultaneously via asyncio.gather,
-        respecting the global cooldown window and per-task backoff.
-
-        Raises:
-            CriticalAPIError: When API returns 401 or 403 status codes.
-        """
         started = time.monotonic()
         report = WBSyncReport(total_items=len(items))
 
@@ -173,7 +146,6 @@ class WildberriesClient:
     # ------------------------------------------------------------------
     @staticmethod
     def _chunk(items: Sequence[WBStockItem], size: int) -> list[Sequence[WBStockItem]]:
-        """Split a sequence into consecutive chunks of ``size`` elements."""
         return [items[index: index + size] for index in range(0, len(items), size)]
 
     async def _send_batch_guarded(
@@ -182,11 +154,6 @@ class WildberriesClient:
             number: int,
             report: WBSyncReport,
     ) -> None:
-        """Acquire semaphore, then send a batch with isolated exponential backoff.
-
-        Raises:
-            CriticalAPIError: Re-raised from _send_batch to stop the scheduler.
-        """
         async with self._batch_semaphore:
             try:
                 await self._send_batch(batch, number, report)
@@ -206,11 +173,6 @@ class WildberriesClient:
             number: int,
             report: WBSyncReport,
     ) -> None:
-        """Send a single batch with isolated exponential backoff retry loop.
-
-        Raises:
-            CriticalAPIError: On 401 or 403 status codes.
-        """
         payload: dict[str, Any] = {"stocks": [item.to_payload() for item in batch]}
         url = self._settings.wb_stocks_url
         headers = self._settings.wb_headers()  # Tokens properly extracted here
@@ -277,7 +239,6 @@ class WildberriesClient:
                 await asyncio.sleep(delay)
 
     async def _register_failure(self, attempt: int, retry_after: Optional[float]) -> float:
-        """Compute the next backoff delay and arm the WB-only cooldown window."""
         delay = self._backoff_base * (2 ** attempt)
         delay = min(delay, self._backoff_max)
         if retry_after is not None:
@@ -289,12 +250,10 @@ class WildberriesClient:
         return delay
 
     async def _relax_cooldown(self) -> None:
-        """Drop the cooldown window after a successful call."""
         async with self._state_lock:
             self._cooldown_until = 0.0
 
     async def _await_cooldown(self) -> None:
-        """Sleep until the client-local cooldown window expires."""
         async with self._state_lock:
             remaining = self._cooldown_until - time.monotonic()
         if remaining > 0:
@@ -303,7 +262,6 @@ class WildberriesClient:
 
     @staticmethod
     def _retry_after(response: aiohttp.ClientResponse) -> Optional[float]:
-        """Parse the ``Retry-After`` header when the server provides one."""
         raw = response.headers.get("Retry-After")
         if not raw:
             return None
@@ -314,7 +272,6 @@ class WildberriesClient:
 
     @staticmethod
     def _parse_error_body(text: str) -> str:
-        """Parse and clean error response body (JSON or plain text)."""
         text = text.strip()
         if not text:
             return "<empty response>"
