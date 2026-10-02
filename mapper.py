@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
 
 import pandas as pd
 
@@ -16,6 +16,7 @@ QTY_COLUMN = "quantity"
 
 
 class MappingError(Exception):
+    pass
 
 
 # ----------------------------------------------------------------------
@@ -23,7 +24,6 @@ class MappingError(Exception):
 # ----------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
 class WBStockItem:
-
     sku: str
     amount: int
 
@@ -33,7 +33,6 @@ class WBStockItem:
 
 @dataclass(frozen=True, slots=True)
 class OzonStockItem:
-
     offer_id: str
     stock: int
     warehouse_id: Optional[int] = None
@@ -47,7 +46,6 @@ class OzonStockItem:
 
 @dataclass(slots=True)
 class MappingResult:
-
     wb_items: list[WBStockItem] = field(default_factory=list)
     ozon_items: list[OzonStockItem] = field(default_factory=list)
     unknown_skus: list[str] = field(default_factory=list)
@@ -75,8 +73,6 @@ class ProductMapper:
     ) -> None:
         self._database_path = Path(database_path)
         self._ozon_warehouse_id = ozon_warehouse_id
-
-        # In-memory cache: filled during load()
         self._cache: dict[str, dict[str, Any]] = {}
         self._reverse_cache_wb: dict[str, str] = {}  # barcode -> sku_internal
         self._reverse_cache_ozon: dict[str, str] = {}  # offer_id -> sku_internal
@@ -88,16 +84,15 @@ class ProductMapper:
             raise MappingError(f"Failed to load products from database: {exc}") from exc
 
         self._cache = products
-
-        # Build reverse lookup caches for WB and Ozon identifiers
         self._reverse_cache_wb.clear()
         self._reverse_cache_ozon.clear()
 
         for sku_internal, product in products.items():
-            if product.get("wb_barcode"):
-                self._reverse_cache_wb[product["wb_barcode"]] = sku_internal
-            if product.get("ozon_offer_id"):
-                self._reverse_cache_ozon[product["ozon_offer_id"]] = sku_internal
+            if product.get("active"):
+                if product.get("wb_barcode"):
+                    self._reverse_cache_wb[product["wb_barcode"]] = sku_internal
+                if product.get("ozon_offer_id"):
+                    self._reverse_cache_ozon[product["ozon_offer_id"]] = sku_internal
 
         logger.info(
             "Mapper cache loaded: %d products (wb_barcodes=%d, ozon_offers=%d)",
@@ -173,18 +168,15 @@ class ProductMapper:
                 result.unknown_skus.append(sku_internal)
                 continue
 
-            # Check active status
             if not product.get("active", False):
                 result.inactive_skus.append(sku_internal)
                 continue
 
-            # Map to Wildberries
             if product.get("wb_barcode"):
                 result.wb_items.append(
                     WBStockItem(sku=product["wb_barcode"], amount=quantity)
                 )
 
-            # Map to Ozon
             if product.get("ozon_offer_id"):
                 result.ozon_items.append(
                     OzonStockItem(
