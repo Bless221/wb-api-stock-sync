@@ -17,7 +17,7 @@ from mapper import WBStockItem
 logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUSES: frozenset[int] = frozenset({408, 425, 429, 500, 502, 503, 504})
-CRITICAL_STATUSES: frozenset[int] = frozenset({401, 403})
+CRITICAL_STATUSES: frozenset[int] = frozenset({401, 403, 400})
 
 
 class CriticalAPIError(Exception):
@@ -32,7 +32,6 @@ class CriticalAPIError(Exception):
 
 @dataclass(slots=True)
 class WBSyncReport:
-
     marketplace: str = "wildberries"
     total_items: int = 0
     sent_items: int = 0
@@ -59,10 +58,9 @@ class WBSyncReport:
 
 class WildberriesClient:
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, session: aiohttp.ClientSession) -> None:
         self._settings = settings
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._owns_session = True
+        self._session = session
 
         self._batch_size = settings.batch_size
         self._base_delay = settings.wb_request_delay
@@ -70,45 +68,10 @@ class WildberriesClient:
         self._backoff_max = settings.wb_backoff_max
         self._max_retries = settings.wb_max_retries
         self._max_concurrent_batches = settings.max_concurrent_batches
-
-        # Isolated rate-limit shield state (Wildberries only)
         self._cooldown_until: float = 0.0
         self._state_lock = asyncio.Lock()
-
-        # Semaphore to limit concurrent batch tasks
         self._batch_semaphore = asyncio.Semaphore(self._max_concurrent_batches)
 
-    # ------------------------------------------------------------------
-    # Context manager
-    # ------------------------------------------------------------------
-    async def __aenter__(self) -> "WildberriesClient":
-        await self._ensure_session()
-        return self
-
-    async def __aexit__(
-            self,
-            exc_type: Optional[type[BaseException]],
-            exc: Optional[BaseException],
-            tb: Optional[TracebackType],
-    ) -> None:
-        await self.close()
-
-    async def _ensure_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=self._settings.request_timeout)
-            connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
-            self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
-            self._owns_session = True
-        return self._session
-
-    async def close(self) -> None:
-        if self._owns_session and self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
     async def update_stocks(self, items: Sequence[WBStockItem]) -> WBSyncReport:
         started = time.monotonic()
         report = WBSyncReport(total_items=len(items))
@@ -118,7 +81,6 @@ class WildberriesClient:
             report.duration_seconds = time.monotonic() - started
             return report
 
-        await self._ensure_session()
         batches = list(self._chunk(items, self._batch_size))
         report.batches_total = len(batches)
         logger.info(
@@ -128,22 +90,17 @@ class WildberriesClient:
             self._max_concurrent_batches,
         )
 
-        # Create all batch tasks and run them in parallel with asyncio.gather
         tasks = [
             self._send_batch_guarded(batch, number + 1, report)
             for number, batch in enumerate(batches)
         ]
 
-        # Gather runs all tasks concurrently (subject to semaphore limit)
-        await asyncio.gather(*tasks, return_exceptions=False)
+        await asyncio.gather(*tasks)
 
         report.duration_seconds = time.monotonic() - started
         logger.info(report.as_line())
         return report
 
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
     @staticmethod
     def _chunk(items: Sequence[WBStockItem], size: int) -> list[Sequence[WBStockItem]]:
         return [items[index: index + size] for index in range(0, len(items), size)]
@@ -158,13 +115,11 @@ class WildberriesClient:
             try:
                 await self._send_batch(batch, number, report)
             except CriticalAPIError:
-                # Re-raise critical errors to stop the scheduler
                 raise
-            except Exception as exc:  # noqa: BLE001 - one batch must not kill the run
+            except Exception as exc:
                 report.batches_failed += 1
                 report.failed_items += len(batch)
-                message = f"batch {number}: {exc}"
-                report.errors.append(message)
+                report.errors.append(f"batch {number}: {exc}")
                 logger.error("[WB] Batch %d failed: %s", number, exc)
 
     async def _send_batch(
@@ -174,26 +129,27 @@ class WildberriesClient:
             report: WBSyncReport,
     ) -> None:
         payload: dict[str, Any] = {"stocks": [item.to_payload() for item in batch]}
-        url = self._settings.wb_stocks_url
-        headers = self._settings.wb_headers()  # Tokens properly extracted here
+        url = f"https://wildberries.ru{self._settings.wb_warehouse_id}"
+        
+        headers = {
+            "Authorization": self._settings.wb_api_token,
+            "Content-Type": "application/json"
+        }
         attempt = 0
 
         while True:
             await self._await_cooldown()
-            session = await self._ensure_session()
 
             try:
-                async with session.put(url, json=payload, headers=headers) as response:
+                async with self._session.put(url, json=payload, headers=headers) as response:
                     status = response.status
                     body = await response.text()
 
-                    # Critical errors: stop immediately without retry
                     if status in CRITICAL_STATUSES:
-                        error_summary = self._parse_error_body(body)
                         raise CriticalAPIError(
                             marketplace="wildberries",
                             status_code=status,
-                            message=error_summary,
+                            message=self._parse_error_body(body),
                         )
 
                     if status in (200, 204):
@@ -207,88 +163,68 @@ class WildberriesClient:
                         report.rate_limit_hits += 1
 
                     if status in RETRYABLE_STATUSES and attempt < self._max_retries:
-                        delay = await self._register_failure(attempt, self._retry_after(response))
+                        retry_after = self._get_retry_after(response)
+                        delay = await self._register_failure(attempt, retry_after)
                         logger.warning(
                             "[WB] Batch %d got HTTP %d, retry %d/%d in %.1fs",
-                            number,
-                            status,
-                            attempt + 1,
-                            self._max_retries,
-                            delay,
+                            number, status, attempt + 1, self._max_retries, delay
                         )
                         attempt += 1
                         await asyncio.sleep(delay)
-                        continue
-
-                    error_summary = self._parse_error_body(body)
-                    raise RuntimeError(f"HTTP {status}: {error_summary}")
+                    else:
+                        raise Exception(f"HTTP error {status}: {self._parse_error_body(body)}")
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 if attempt >= self._max_retries:
-                    raise RuntimeError(f"network error: {exc}") from exc
+                    raise Exception(f"Network error after max retries: {exc}") from exc
                 delay = await self._register_failure(attempt, None)
-                logger.warning(
-                    "[WB] Batch %d network error (%s), retry %d/%d in %.1fs",
-                    number,
-                    exc,
-                    attempt + 1,
-                    self._max_retries,
-                    delay,
-                )
+                logger.warning("[WB] Network error on batch %d, retrying in %.1fs: %s", number, delay, exc)
                 attempt += 1
                 await asyncio.sleep(delay)
 
-    async def _register_failure(self, attempt: int, retry_after: Optional[float]) -> float:
-        delay = self._backoff_base * (2 ** attempt)
-        delay = min(delay, self._backoff_max)
-        if retry_after is not None:
-            delay = max(delay, min(retry_after, self._backoff_max))
-        delay += random.uniform(0.0, min(1.0, delay * 0.1))  # jitter
+    # ------------------------------------------------------------------
+    # Атомарное управление защитным щитом лимитов (Rate Limit Shield)
+    # ------------------------------------------------------------------
+    async def _await_cooldown(self) -> None:
+        while True:
+            now = time.monotonic()
+            async with self._state_lock:
+                diff = self._cooldown_until - now
+                if diff <= 0:
+                    return
+            await asyncio.sleep(diff)
 
+    async def _register_failure(self, attempt: int, retry_after: Optional[float]) -> float:
         async with self._state_lock:
-            self._cooldown_until = max(self._cooldown_until, time.monotonic() + delay)
-        return delay
+            if retry_after and retry_after > 0:
+                delay = retry_after
+            else:
+                delay = min(self._backoff_max, self._backoff_base * (2 ** attempt))
+                delay += random.uniform(0, 0.5 * delay)  # Jitter
+            
+            self._cooldown_until = time.monotonic() + delay
+            return delay
 
     async def _relax_cooldown(self) -> None:
         async with self._state_lock:
-            self._cooldown_until = 0.0
-
-    async def _await_cooldown(self) -> None:
-        async with self._state_lock:
-            remaining = self._cooldown_until - time.monotonic()
-        if remaining > 0:
-            logger.debug("[WB] Cooling down for %.1fs", remaining)
-            await asyncio.sleep(remaining)
+            self._cooldown_until = time.monotonic() + self._base_delay
 
     @staticmethod
-    def _retry_after(response: aiohttp.ClientResponse) -> Optional[float]:
-        raw = response.headers.get("Retry-After")
-        if not raw:
-            return None
-        try:
-            return float(raw)
-        except ValueError:
-            return None
+    def _get_retry_after(response: aiohttp.ClientResponse) -> Optional[float]:
+        header = response.headers.get("Retry-After")
+        if header:
+            try:
+                return float(header)
+            except ValueError:
+                return None
+        return None
 
     @staticmethod
-    def _parse_error_body(text: str) -> str:
-        text = text.strip()
-        if not text:
-            return "<empty response>"
-
-        # Try to parse as JSON and extract meaningful error message
+    def _parse_error_body(body: str) -> str:
         try:
-            data = json.loads(text)
+            data = json.loads(body)
             if isinstance(data, dict):
-                # Check for common error fields
-                for key in ("message", "error", "errorText", "description"):
-                    if key in data:
-                        msg = data[key]
-                        if isinstance(msg, str):
-                            return msg[:500]
-                # If no standard field, return stringified dict (first 500 chars)
-                return str(data)[:500]
-            return str(data)[:500]
-        except (json.JSONDecodeError, ValueError):
-            # Plain text response
-            return text[:500]
+                return data.get("error", {}).get("message", body[:200])
+        except Exception:
+            pass
+        return body[:200]
