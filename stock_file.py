@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import logging
 import os
@@ -39,7 +40,6 @@ class StockFileManager:
         if file_size == 0:
             raise StockFileError(f"Stock file is empty: {self._csv_path}")
 
-        # Quick validation of required columns
         try:
             with open(self._csv_path, "r", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
@@ -74,9 +74,7 @@ class StockFileManager:
         except Exception as exc:
             raise StockFileError(f"Failed to create backup: {exc}") from exc
 
-        # Rotate old backups: keep only 10 most recent
         self._rotate_backups()
-
         return backup_path
 
     def _rotate_backups(self) -> None:
@@ -90,10 +88,7 @@ class StockFileManager:
             if len(backups) > BACKUP_MAX_COUNT:
                 for old_backup in backups[BACKUP_MAX_COUNT:]:
                     old_backup.unlink()
-                    logger.debug(
-                        "Deleted old backup: %s",
-                        old_backup.name,
-                    )
+                    logger.debug("Deleted old backup: %s", old_backup.name)
         except Exception as exc:
             logger.warning("Failed to rotate backups: %s", exc)
 
@@ -103,7 +98,6 @@ class StockFileManager:
         if retry_delays is None:
             retry_delays = [1.0, 3.0, 5.0]
 
-        # Ensure retry_delays has enough entries
         while len(retry_delays) < max_retries:
             retry_delays.append(retry_delays[-1] + 2.0)
 
@@ -111,8 +105,6 @@ class StockFileManager:
 
         while attempt <= max_retries:
             try:
-                import asyncio
-
                 total_rows, df = await self._async_read_csv()
                 logger.info(
                     "Stock file read successfully (attempt %d/%d): %d rows",
@@ -142,28 +134,22 @@ class StockFileManager:
                     exc,
                 )
 
-                import asyncio
                 await asyncio.sleep(delay)
                 attempt += 1
 
             except StockFileError:
-                # Validation errors shouldn't be retried
                 raise
             except Exception as exc:
                 logger.error("Unexpected error reading stock file: %s", exc)
                 raise StockFileUnavailableError(f"Unexpected error: {exc}") from exc
 
     async def _async_read_csv(self) -> tuple[int, pd.DataFrame]:
-        import asyncio
-
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._read_csv_sync)
 
     def _read_csv_sync(self) -> tuple[int, pd.DataFrame]:
-        chunk_size = self._settings.csv_chunk_size
         accumulated: dict[str, dict[str, Any]] = {}
         total_rows = 0
-        chunks_processed = 0
 
         try:
             with open(self._csv_path, "r", encoding="utf-8") as f:
@@ -189,28 +175,16 @@ class StockFileManager:
                         )
                         continue
 
-                    # Deduplicate on the fly: last occurrence wins
                     accumulated[sku] = {"item_sku": sku, "quantity": qty}
-
-                    if len(accumulated) >= chunk_size:
-                        chunks_processed += 1
-                        logger.debug(
-                            "Chunk #%d accumulated: %d unique SKUs",
-                            chunks_processed,
-                            len(accumulated),
-                        )
-                        accumulated = {}
 
         except Exception as exc:
             logger.exception("Failed to read stock file: %s", self._csv_path)
             raise
 
-        # Final chunk: convert accumulated dict to DataFrame
         final_df = pd.DataFrame(list(accumulated.values()))
         logger.info(
-            "Stock file streamed: %d total rows, %d unique SKUs, %d chunks processed",
+            "Stock file processed in background thread: %d total lines parsed, %d unique SKUs loaded",
             total_rows,
             len(final_df),
-            chunks_processed,
         )
         return total_rows, final_df
