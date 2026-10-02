@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED, JobEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -17,42 +17,43 @@ JOB_ID = "marketplace_stock_sync"
 
 class SyncScheduler:
 
-    def __init__(
-            self,
-            settings: Settings,
-            job: Callable[[], Awaitable[None]],
-    ) -> None:
+    def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._job = job
-        self._scheduler: Optional[AsyncIOScheduler] = None
+        self._scheduler: AsyncIOScheduler = AsyncIOScheduler(timezone="Europe/Moscow")
         self._stop_event = asyncio.Event()
         self._is_shutting_down = False
+        self._job_func: Optional[Callable[[], Awaitable[None]]] = None
+
+    def add_sync_job(self, func: Callable[[], Awaitable[None]]) -> None:
+        """Динамически регистрирует основную задачу синхронизации остатков."""
+        self._job_func = func
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
     def start(self) -> AsyncIOScheduler:
-        scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
-        scheduler.add_job(
+        if not self._job_func:
+            raise ValueError("Cannot start scheduler: sync job functions must be added first via add_sync_job()")
+
+        self._scheduler.add_job(
             self._guarded_job,
             trigger=IntervalTrigger(minutes=self._settings.sync_interval_minutes),
             id=JOB_ID,
             name="Marketplace stock synchronisation",
-            max_instances=1,  # never overlap two cycles
-            coalesce=True,  # collapse missed runs into one
+            max_instances=1,
+            coalesce=True,
             misfire_grace_time=120,
             replace_existing=True,
         )
-        scheduler.add_listener(self._on_job_problem, EVENT_JOB_ERROR | EVENT_JOB_MISSED)
-        scheduler.start()
-        self._scheduler = scheduler
+        self._scheduler.add_listener(self._on_job_problem, EVENT_JOB_ERROR | EVENT_JOB_MISSED)
+        self._scheduler.start()
 
         logger.info(
-            "Scheduler started: every %d minute(s), job id=%s",
+            "Scheduler successfully started: running every %d minute(s), job id=%s",
             self._settings.sync_interval_minutes,
             JOB_ID,
         )
-        return scheduler
+        return self._scheduler
 
     async def run_forever(self) -> None:
         await self._stop_event.wait()
@@ -64,7 +65,7 @@ class SyncScheduler:
 
         self._is_shutting_down = True
 
-        if self._scheduler is not None and self._scheduler.running:
+        if self._scheduler and self._scheduler.running:
             self._scheduler.shutdown(wait=wait)
             logger.info("Scheduler stopped")
         self._stop_event.set()
@@ -73,17 +74,21 @@ class SyncScheduler:
     # Internals
     # ------------------------------------------------------------------
     async def _guarded_job(self) -> None:
+        if not self._job_func:
+            return
+
         try:
-            await self._job()
+            res = self._job_func()
+            if asyncio.iscoroutine(res):
+                await res
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 - scheduler must survive normal job errors
-            # Already logged in run_sync_cycle, just note here
-            logger.debug("Sync cycle failed: %s (see above for details)", type(exc).__name__)
+        except Exception as exc:
+            logger.debug("Sync cycle wrapper intercepted an error: %s", type(exc).__name__)
 
     @staticmethod
     def _on_job_problem(event: JobEvent) -> None:
         if getattr(event, "exception", None) is not None:
-            logger.error("APScheduler job '%s' raised: %s", event.job_id, event.exception)
+            logger.error("APScheduler job '%s' raised an unhandled exception: %s", event.job_id, event.exception)
         else:
-            logger.warning("APScheduler job '%s' was missed", event.job_id)
+            logger.warning("APScheduler job '%s' was missed or skipped due to overlap", event.job_id)
