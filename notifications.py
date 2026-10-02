@@ -18,24 +18,26 @@ class TelegramNotifier:
         self._settings = settings
         self._session = session
         self._owns_session = session is None
+        self._base_url = "https://api.telegram.org"
+        self._has_alerts = settings.telegram_bot_token is not None and settings.telegram_chat_id is not None
 
-        if not settings.telegram_enabled:
-            logger.debug("Telegram notifications disabled (no token/chat_id)")
+        if not self._has_alerts:
+            logger.debug("Telegram notifications are disabled (missing bot token or chat id)")
+            self._bot_token = None
+            self._chat_id = None
             return
 
-        self._bot_token = settings.telegram_token_str()
+        self._bot_token = settings.telegram_bot_token.get_secret_value()
         self._chat_id = settings.telegram_chat_id
-        self._base_url = "https://api.telegram.org"
 
     async def __aenter__(self) -> "TelegramNotifier":
         await self._ensure_session()
         return self
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         await self.close()
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
-        """Create HTTP session lazily if not injected."""
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=self._settings.request_timeout)
             connector = aiohttp.TCPConnector(limit=5, ttl_dns_cache=300)
@@ -44,7 +46,6 @@ class TelegramNotifier:
         return self._session
 
     async def close(self) -> None:
-        """Close session if owned by this notifier."""
         if self._owns_session and self._session and not self._session.closed:
             await self._session.close()
             self._session = None
@@ -52,28 +53,27 @@ class TelegramNotifier:
     async def notify_critical_error(
             self, title: str, message: str, marketplace: str = ""
     ) -> bool:
-        if not self._settings.telegram_enabled:
-            logger.debug("Telegram notifications disabled, skipping: %s", title)
+        if not self._has_alerts:
             return False
 
-        text = f"{title}\n\n{message}"
+        text = f"<b>{title}</b>\n\n{message}"
         if marketplace:
-            text = f"{text}\n\n📊 Marketplace: {marketplace}"
+            text = f"{text}\n\n📊 <b>Marketplace:</b> <code>{marketplace.upper()}</code>"
 
         return await self._send_message(text)
 
     async def notify_sync_success(self, summary: str) -> bool:
-        if not self._settings.telegram_enabled:
+        if not self._has_alerts:
             return False
 
-        text = f"✅ Sync completed successfully\n\n{summary}"
+        text = f"✅ <b>Sync completed successfully</b>\n\n{summary}"
         return await self._send_message(text)
 
     async def notify_sync_warning(self, title: str, details: str) -> bool:
-        if not self._settings.telegram_enabled:
+        if not self._has_alerts:
             return False
 
-        text = f"⚠️ {title}\n\n{details}"
+        text = f"⚠️ <b>{title}</b>\n\n{details}"
         return await self._send_message(text)
 
     async def _send_message(self, text: str) -> bool:
@@ -81,12 +81,10 @@ class TelegramNotifier:
             logger.warning("Telegram credentials missing, cannot send notification")
             return False
 
-        # Truncate if too long (Telegram limit is 4096)
         if len(text) > 4096:
             text = text[:4090] + "\n..."
 
         async def _do_send() -> bool:
-            """Actual send logic."""
             try:
                 session = await self._ensure_session()
                 url = f"{self._base_url}/bot{self._bot_token}/sendMessage"
@@ -120,11 +118,10 @@ class TelegramNotifier:
                 logger.exception("Unexpected error sending Telegram notification: %s", exc)
                 return False
 
-        # Use shield to prevent cancellation if main loop is shutting down
         try:
             return await asyncio.shield(_do_send())
         except asyncio.CancelledError:
-            logger.warning("Telegram notification cancelled (main loop shutting down)")
+            logger.warning("Telegram notification cancelled during system shutdown process")
             return False
 
     @staticmethod
