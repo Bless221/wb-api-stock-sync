@@ -36,7 +36,6 @@ logger = logging.getLogger("stock_sync")
 # Logging
 # ----------------------------------------------------------------------
 def setup_logging(settings: Settings) -> None:
-    # Ensure log directory exists
     settings.log_file.parent.mkdir(parents=True, exist_ok=True)
 
     formatter = logging.Formatter(
@@ -63,19 +62,18 @@ def setup_logging(settings: Settings) -> None:
 
 
 # ----------------------------------------------------------------------
-# Synchronisation cycle
+# Synchronization cycle
 # ----------------------------------------------------------------------
 async def run_sync_cycle(
         settings: Settings,
         mapper: ProductMapper,
-        scheduler: SyncScheduler,
         notifier: TelegramNotifier,
-        http_session: aiohttp.ClientSession,
+        wb_client: WildberriesClient,
+        ozon_client: OzonClient,
 ) -> None:
     logger.info("=" * 80)
     logger.info("SYNC CYCLE STARTED")
 
-    cycle_start = time.monotonic()
     file_manager = StockFileManager(settings)
 
     # ================================================================
@@ -92,7 +90,7 @@ async def run_sync_cycle(
             message=str(exc),
         )
         logger.info("=" * 80)
-        raise
+        return
 
     # ================================================================
     # Stage 2: Read stock file with retry logic
@@ -109,7 +107,7 @@ async def run_sync_cycle(
             message=str(exc),
         )
         logger.info("=" * 80)
-        raise
+        return
 
     if df.empty:
         logger.warning("No stock data available after streaming, cycle skipped")
@@ -132,7 +130,7 @@ async def run_sync_cycle(
             message=str(exc),
         )
         logger.info("=" * 80)
-        raise
+        return
 
     # ================================================================
     # Stage 4: Map stock data to marketplace items
@@ -142,7 +140,7 @@ async def run_sync_cycle(
     except MappingError:
         logger.exception("Mapping failed, cycle aborted")
         logger.info("=" * 80)
-        raise
+        return
 
     if not mapping.wb_items and not mapping.ozon_items:
         logger.warning(
@@ -161,224 +159,112 @@ async def run_sync_cycle(
     labels: list[str] = []
     sync_reports = {}
 
-    try:
-        wb_client = WildberriesClient(settings, http_session)
-        ozon_client = OzonClient(settings, http_session)
+    # --- Wildberries ------------------------------------------------
+    if settings.enable_wb and mapping.wb_items:
+        task = asyncio.create_task(wb_client.update_stocks(mapping.wb_items))
+        tasks.append(task)
+        labels.append("wildberries")
+        logger.info("[WB] Sending %d items in batches", len(mapping.wb_items))
 
-        # --- Wildberries ------------------------------------------------
-        if settings.enable_wb and mapping.wb_items:
-            task = asyncio.create_task(wb_client.update_stocks(mapping.wb_items))
-            tasks.append(task)
-            labels.append("wildberries")
-            logger.info("[WB] Sending %d items in batches", len(mapping.wb_items))
+    # --- Ozon --------------------------------------------------------
+    if settings.enable_ozon and mapping.ozon_items:
+        task = asyncio.create_task(ozon_client.update_stocks(mapping.ozon_items))
+        tasks.append(task)
+        labels.append("ozon")
+        logger.info("[OZON] Sending %d items in batches", len(mapping.ozon_items))
 
-        # --- Ozon --------------------------------------------------------
-        if settings.enable_ozon and mapping.ozon_items:
-            task = asyncio.create_task(ozon_client.update_stocks(mapping.ozon_items))
-            tasks.append(task)
-            labels.append("ozon")
-            logger.info("[OZON] Sending %d items in batches", len(mapping.ozon_items))
+    if not tasks:
+        logger.warning("All marketplaces disabled or no items to send")
+        logger.info("=" * 80)
+        return
 
-        if not tasks:
-            logger.warning("All marketplaces disabled or no items to send")
-            logger.info("=" * 80)
-            return
-
-        # Run all sync tasks in parallel
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # ================================================================
-        # Stage 6: Process results and handle errors
-        # ================================================================
-        critical_errors = []
-
-        for label, result in zip(labels, results):
-            if isinstance(result, CriticalAPIError):
-                logger.critical(
-                    "[%s] CRITICAL API ERROR: HTTP %d - %s",
-                    label.upper(),
-                    result.status_code,
-                    result.message,
-                )
-                critical_errors.append(result)
-
-            elif isinstance(result, BaseException):
-                logger.error("[%s] Pipeline crashed: %s", label.upper(), result)
-                sync_reports[label] = {
-                    "status": "FAILED",
-                    "error": str(result),
-                }
-
-            else:
-                logger.info("[RESULT] %s", result.as_line())
-                sync_reports[label] = {
-                    "status": "OK" if result.success else "PARTIAL",
-                    "report": result.as_line(),
-                    "sent": result.sent_items,
-                    "total": result.total_items,
-                    "failed": result.failed_items,
-                }
-
-        # If critical API errors occurred, notify and stop scheduler
-        if critical_errors:
-            for exc in critical_errors:
-                await notifier.notify_critical_error(
-                    title=exc.message,
-                    message=f"HTTP {exc.status_code} error - scheduler stopping",
-                    marketplace=exc.marketplace,
-                )
-            scheduler.shutdown()
-            raise critical_errors[0]
-
-    except CriticalAPIError:
-        raise
-    except Exception as exc:
-        logger.exception("Unexpected error during sync cycle")
-        await notifier.notify_critical_error(
-            title="🚨 CRITICAL: Unexpected Error",
-            message=str(exc),
-        )
-        raise
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # ================================================================
-    # Stage 7: Finalize and report
+    # Stage 6: Process results and handle errors
     # ================================================================
-    cycle_duration = time.monotonic() - cycle_start
-    logger.info("SYNC CYCLE FINISHED | total_csv_rows=%d | duration=%.2fs",
-                total_rows, cycle_duration)
+    critical_errors = []
 
-    # Send success notification if configured
-    if settings.telegram_enabled and sync_reports:
-        summary_lines = [
-            f"✅ Sync completed in {cycle_duration:.1f}s",
-            f"📊 Processed {total_rows} rows from stock file",
-        ]
-        for marketplace, report in sync_reports.items():
-            if report["status"] == "OK":
-                summary_lines.append(
-                    f"  • {marketplace.upper()}: {report['sent']}/{report['total']} items"
-                )
-        summary = "\n".join(summary_lines)
-        await notifier.notify_sync_success(summary)
+    for label, result in zip(labels, results):
+        if isinstance(result, CriticalAPIError):
+            logger.critical(
+                "[%s] CRITICAL API ERROR: HTTP %d - %s",
+                label.upper(),
+                result.status_code,
+                result.message,
+            )
+            critical_errors.append(result)
 
+        elif isinstance(result, BaseException):
+            logger.error("[%s] Pipeline crashed: %s", label.upper(), result)
+            sync_reports[label] = {
+                "status": "FAILED",
+                "error": str(result),
+            }
+
+        else:
+            logger.info("[RESULT] %s", result.as_line())
+            sync_reports[label] = {
+                "status": "OK" if result.success else "PARTIAL",
+                "report": result.as_line(),
+                "sent": result.sent_items,
+                "total": result.total_items,
+                "failed": result.failed_items,
+            }
+
+    if critical_errors:
+        for exc in critical_errors:
+            await notifier.notify_critical_error(
+                title="🚨 CRITICAL Marketplace API Error",
+                message=f"[{label.upper()}] HTTP {exc.status_code} - {exc.message}. Stopping scheduler.",
+            )
+    
+    logger.info("SYNC CYCLE COMPLETED")
     logger.info("=" * 80)
 
 
 # ----------------------------------------------------------------------
-# Bootstrap
+# Application Entrypoint
 # ----------------------------------------------------------------------
 async def main() -> None:
     settings = get_settings()
     setup_logging(settings)
 
-    logger.info("=" * 80)
-    logger.info("Multi-marketplace Stock Sync v2.3 (SQLite + Telegram + Backups)")
-    logger.info(
-        "Marketplaces: WB=%s, Ozon=%s | interval=%d min | "
-        "batch=%d | stream_chunk=%d | max_concurrent=%d | db=%s",
-        settings.enable_wb,
-        settings.enable_ozon,
-        settings.sync_interval_minutes,
-        settings.batch_size,
-        settings.csv_chunk_size,
-        settings.max_concurrent_batches,
-        settings.database_path,
-    )
-    if settings.telegram_enabled:
-        logger.info("Telegram notifications ENABLED for critical errors")
-    else:
-        logger.info("Telegram notifications DISABLED")
-    logger.info("=" * 80)
+    logger.info("Starting Multi-Marketplace Stock Sync v2.0...")
 
-    # ================================================================
-    # Initialize HTTP session (shared across all clients)
-    # ================================================================
+    try:
+        mapping_path = Path("mapping.json")
+        await init_database(Path(settings.database_path), mapping_path)
+    except DatabaseError as exc:
+        logger.critical("Failed to initialize system database: %s", exc)
+        sys.exit(1)
+
     timeout = aiohttp.ClientTimeout(total=settings.request_timeout)
-    connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
-    http_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+    async with aiohttp.ClientSession(timeout=timeout) as http_session:
+        
+        notifier = TelegramNotifier(settings, http_session)
+        mapper = ProductMapper(Path(settings.database_path), settings.ozon_warehouse_id)
+        wb_client = WildberriesClient(settings, http_session)
+        ozon_client = OzonClient(settings, http_session)
 
-    # ================================================================
-    # Initialize Telegram notifier
-    # ================================================================
-    notifier = TelegramNotifier(settings, http_session)
-
-    try:
-        # ================================================================
-        # Initialize database
-        # ================================================================
-        try:
-            await init_database(settings.database_path, settings.mapping_path)
-        except DatabaseError as exc:
-            logger.critical("Cannot start without a valid database: %s", exc)
-            await notifier.notify_critical_error(
-                title="🚨 CRITICAL: Database Initialization Failed",
-                message=str(exc),
-            )
-            await http_session.close()
-            return
-
-        # ================================================================
-        # Load product mapper from database
-        # ================================================================
-        mapper = ProductMapper(
-            database_path=settings.database_path,
-            ozon_warehouse_id=settings.ozon_warehouse_id,
+        scheduler = SyncScheduler(settings)
+        
+        scheduler.add_sync_job(
+            func=lambda: run_sync_cycle(settings, mapper, notifier, wb_client, ozon_client)
         )
 
-        # ================================================================
-        # Setup scheduler
-        # ================================================================
-        scheduler = SyncScheduler(
-            settings,
-            job=lambda: run_sync_cycle(settings, mapper, scheduler, notifier, http_session),
-        )
         scheduler.start()
-        _install_signal_handlers(scheduler)
+        logger.info("Scheduler running. Press Ctrl+C to exit.")
 
-        # ================================================================
-        # Run startup sync if enabled
-        # ================================================================
-        if settings.run_on_startup:
-            logger.info("Running initial sync on startup...")
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        
+        for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                await run_sync_cycle(settings, mapper, scheduler, notifier, http_session)
-            except (CriticalAPIError, NotifiableError) as exc:
-                logger.critical("STARTUP SYNC FAILED: %s", exc)
-                scheduler.shutdown()
-                await http_session.close()
-                return
-            except Exception as exc:
-                logger.exception("STARTUP SYNC FAILED WITH UNEXPECTED ERROR")
-                scheduler.shutdown()
-                await http_session.close()
-                return
+                loop.add_signal_handler(sig, stop_event.set)
+            except NotImplementedError:
+                # На Windows add_signal_handler не поддерживается
+                pass
 
-        # ================================================================
-        # Run scheduler forever
-        # ================================================================
-        logger.info("Daemon is running. Press Ctrl+C to stop.")
-        await scheduler.run_forever()
-
-    finally:
-        logger.info("Shutting down...")
-        await http_session.close()
-        logger.info("Shutdown complete")
-
-
-def _install_signal_handlers(scheduler: SyncScheduler) -> None:
-    loop = asyncio.get_running_loop()
-    for sig_name in ("SIGINT", "SIGTERM"):
-        sig = getattr(signal, sig_name, None)
-        if sig is None:
-            continue
-        try:
-            loop.add_signal_handler(sig, scheduler.shutdown)
-        except NotImplementedError:  # Windows event loop
-            continue
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logging.getLogger("stock_sync").info("Stopped by user")
+        if RUN_ON_STARTUP := getattr(settings, "run_on_startup", True):
+            logger.info("Executing initial startup synchronization run...")
