@@ -1,0 +1,61 @@
+version: "3.9"
+
+services:
+  sync-daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wb-ozon-sync
+    restart: unless-stopped
+    
+    # Environment variables
+    environment:
+      - WB_API_TOKEN=${WB_API_TOKEN}
+      - WB_WAREHOUSE_ID=${WB_WAREHOUSE_ID}
+      - OZON_CLIENT_ID=${OZON_CLIENT_ID}
+      - OZON_API_KEY=${OZON_API_KEY}
+      - OZON_WAREHOUSE_ID=${OZON_WAREHOUSE_ID:-}
+      - ENABLE_WB=${ENABLE_WB:-true}
+      - ENABLE_OZON=${ENABLE_OZON:-true}
+      - CSV_PATH=/app/stocks.csv
+      - DATABASE_PATH=/app/data/stocks.db
+      - MAPPING_PATH=/app/mapping.json
+      - SYNC_INTERVAL_MINUTES=${SYNC_INTERVAL_MINUTES:-15}
+      - RUN_ON_STARTUP=${RUN_ON_STARTUP:-true}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_FILE=/app/logs/sync.log
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+    
+    # Volume mounts
+    volumes:
+      - ./stocks.csv:/app/stocks.csv:ro
+      - ./mapping.json:/app/mapping.json:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    
+    # Resource limits (optional)
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
