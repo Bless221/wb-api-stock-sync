@@ -94,7 +94,6 @@ async def run_sync_cycle(
     try:
         total_rows, df = await file_manager.read_with_retry(
             max_retries=3,
-            retry_delays=[1.0, 3.0, 5.0],
         )
     except StockFileUnavailableError as exc:
         logger.error("Stock file unavailable after all retries: %s", exc)
@@ -153,7 +152,7 @@ async def run_sync_cycle(
     # ================================================================
     tasks: list[asyncio.Task[Any]] = []
     labels: list[str] = []
-    sync_reports = {}
+    sync_reports: dict[str, Any] = {}
 
     # --- Wildberries ------------------------------------------------
     if settings.enable_wb and mapping.wb_items:
@@ -208,8 +207,7 @@ async def run_sync_cycle(
                 "total": result.total_items,
                 "failed": result.failed_items,
             }
-            if result.success:
-                success_summaries.append(result.as_line())
+            success_summaries.append(result.as_line())
 
     if critical_errors:
         for exc in critical_errors:
@@ -252,7 +250,7 @@ async def main() -> None:
         ozon_client = OzonClient(settings, http_session)
 
         scheduler = SyncScheduler(settings)
-        
+     
         sync_job = lambda: run_sync_cycle(settings, mapper, notifier, wb_client, ozon_client)
         scheduler.add_sync_job(sync_job)
 
@@ -280,6 +278,14 @@ async def main() -> None:
                 await sync_job()
             except Exception as exc:
                 logger.error("Initial startup sync execution failed: %s", exc)
+                
+
+                if "terminated due to critical marketplace API errors" in str(exc):
+                    logger.critical("Forcing system shutdown due to failed startup verification checks")
+                    scheduler.shutdown(wait=False)
+                    await notifier.close()
+                    sys.exit(1)
+
         try:
             await stop_event.wait()
         except (KeyboardInterrupt, SystemExit):
