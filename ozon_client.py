@@ -123,11 +123,11 @@ class OzonClient:
             report: OzonSyncReport,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"stocks": [item.to_payload() for item in batch]}
-        url = self._settings.ozon_stocks_url  # Переведено на хелпер путей из настроек
+        url = self._settings.ozon_stocks_url
         
         headers = {
-            "Client-Id": self._settings.ozon_client_id.get_secret_value(),  # Раскрытие SecretStr
-            "Api-Key": self._settings.ozon_api_key.get_secret_value(),      # Раскрытие SecretStr
+            "Client-Id": self._settings.ozon_client_id.get_secret_value(),
+            "Api-Key": self._settings.ozon_api_key.get_secret_value(),
             "Content-Type": "application/json"
         }
         attempt = 0
@@ -207,12 +207,20 @@ class OzonClient:
         batch_rejected = 0
 
         for item in results:
+            if not isinstance(item, dict):
+                continue
+            
             if item.get("updated", False):
                 batch_sent += 1
             else:
                 batch_rejected += 1
-                errors = item.get("errors", [])
-                err_msg = errors.get("message", "Unknown error") if errors else "Rejected"
+                errors = item.get("errors")
+                err_msg = "Rejected"
+                if isinstance(errors, dict):
+                    err_msg = errors.get("message", "Unknown error")
+                elif isinstance(errors, list) and errors:
+                    err_msg = errors[0].get("message", "Unknown error") if isinstance(errors[0], dict) else str(errors[0])
+                
                 logger.warning("[OZON] SKU %s rejected: %s", item.get("offer_id"), err_msg)
 
         report.sent_items += batch_sent
@@ -245,7 +253,11 @@ class OzonClient:
         try:
             data = json.loads(body)
             if isinstance(data, dict):
-                return data.get("message", body[:200])
+                # Ozon API v2/v3 отдает ошибку либо в корневом message, либо в объекте error
+                if "message" in data:
+                    return str(data["message"])
+                elif "error" in data and isinstance(data["error"], dict):
+                    return str(data["error"].get("message", body[:200]))
         except Exception:
             pass
         return body[:200]
