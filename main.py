@@ -4,21 +4,17 @@ import asyncio
 import logging
 import signal
 import sys
-import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import aiohttp
-import pandas as pd
 
 from config import Settings, get_settings
 from database import DatabaseError, init_database
 from exceptions import (
     CriticalAPIError,
-    CriticalDatabaseError,
     MappingError,
-    NotifiableError,
     StockFileError,
     StockFileUnavailableError,
 )
@@ -184,6 +180,7 @@ async def run_sync_cycle(
     # Stage 6: Process results and handle errors
     # ================================================================
     critical_errors = []
+    success_summaries = []
 
     for label, result in zip(labels, results):
         if isinstance(result, CriticalAPIError):
@@ -211,13 +208,20 @@ async def run_sync_cycle(
                 "total": result.total_items,
                 "failed": result.failed_items,
             }
+            if result.success:
+                success_summaries.append(result.as_line())
 
     if critical_errors:
         for exc in critical_errors:
             await notifier.notify_critical_error(
                 title="🚨 CRITICAL Marketplace API Error",
-                message=f"[{label.upper()}] HTTP {exc.status_code} - {exc.message}. Stopping scheduler.",
+                message=f"[{exc.marketplace.upper()}] HTTP {exc.status_code} - {exc.message}. Stopping scheduler.",
+                marketplace=exc.marketplace
             )
+        raise Exception("Sync loop terminated due to critical marketplace API errors")
+
+    if success_summaries and not critical_errors:
+        await notifier.notify_sync_success(summary="\n".join(success_summaries))
     
     logger.info("SYNC CYCLE COMPLETED")
     logger.info("=" * 80)
@@ -249,22 +253,46 @@ async def main() -> None:
 
         scheduler = SyncScheduler(settings)
         
-        scheduler.add_sync_job(
-            func=lambda: run_sync_cycle(settings, mapper, notifier, wb_client, ozon_client)
-        )
+        sync_job = lambda: run_sync_cycle(settings, mapper, notifier, wb_client, ozon_client)
+        scheduler.add_sync_job(sync_job)
 
         scheduler.start()
         logger.info("Scheduler running. Press Ctrl+C to exit.")
-
         stop_event = asyncio.Event()
         loop = asyncio.get_running_loop()
         
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, stop_event.set)
-            except NotImplementedError:
-                # На Windows add_signal_handler не поддерживается
-                pass
+        def handle_exit_signal() -> None:
+            logger.info("Received exit signal. Shutting down gracefully...")
+            stop_event.set()
 
-        if RUN_ON_STARTUP := getattr(settings, "run_on_startup", True):
+        if sys.platform != "win32":
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, handle_exit_signal)
+        else:
+            async def windows_wakeup() -> None:
+                while not stop_event.is_set():
+                    await asyncio.sleep(0.5)
+            asyncio.create_task(windows_wakeup())
+
+        if getattr(settings, "run_on_startup", True):
             logger.info("Executing initial startup synchronization run...")
+            try:
+                await sync_job()
+            except Exception as exc:
+                logger.error("Initial startup sync execution failed: %s", exc)
+        try:
+            await stop_event.wait()
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("Intercepted exit interrupt sequence.")
+        finally:
+            logger.info("Cleaning up running services and connection pools...")
+            scheduler.shutdown(wait=True)
+            await notifier.close()
+            logger.info("Application successfully stopped.")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("\nProcess execution terminated by user request.")
