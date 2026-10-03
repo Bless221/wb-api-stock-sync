@@ -2,22 +2,28 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import aiosqlite
 
-logger = logging.getLogger(__name__)
-
+logger = logging.getLogger("database")
 
 class DatabaseError(Exception):
+    """Базовое исключение для ошибок базы данных."""
     pass
 
+@dataclass(frozen=True)
+class DBProduct:
+    sku_internal: str
+    wb_barcode: Optional[str]
+    ozon_offer_id: Optional[str]
+    active: bool
 
 async def init_database(database_path: Path, mapping_path: Path) -> None:
+    """Инициализирует схему БД, включаем WAL-режим и запускает миграцию данных."""
     database_path.parent.mkdir(parents=True, exist_ok=True)
-
     try:
         async with aiosqlite.connect(database_path, isolation_level=None) as db:
             await db.execute("PRAGMA journal_mode=WAL;")
@@ -26,170 +32,69 @@ async def init_database(database_path: Path, mapping_path: Path) -> None:
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS products (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    sku_internal TEXT NOT NULL UNIQUE,
-                    title TEXT DEFAULT '',
+                    sku_internal TEXT UNIQUE NOT NULL,
                     wb_barcode TEXT,
                     ozon_offer_id TEXT,
-                    active BOOLEAN DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
+                    active BOOLEAN DEFAULT 1
+                );
             """)
-
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_sku_internal ON products (sku_internal)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_wb_barcode ON products (wb_barcode)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_ozon_offer_id ON products (ozon_offer_id)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_active ON products (active)")
-
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_products_sku ON products(sku_internal);")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_products_wb ON products(wb_barcode) WHERE wb_barcode IS NOT NULL;")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_products_ozon ON products(ozon_offer_id) WHERE ozon_offer_id IS NOT NULL;")
         logger.info("Database schema initialized successfully (WAL mode enabled): %s", database_path)
         await _sync_from_json(database_path, mapping_path)
-
     except Exception as exc:
-        logger.exception("Failed to initialize database")
+        logger.error("Failed to initialize database: %s", exc)
         raise DatabaseError(f"Database initialization failed: {exc}") from exc
 
-
 async def _sync_from_json(database_path: Path, mapping_path: Path) -> None:
-    """Синхронизирует данные из mapping.json в SQLite с использованием временных стейджинг-таблиц."""
+    """Синхронизирует данные из mapping.json в SQLite."""
     if not mapping_path.exists():
-        logger.debug("mapping.json not found, skipping sync")
+        logger.warning("Mapping source file not found at %s. Skipping synchronization.", mapping_path)
         return
-
-    logger.info("Synchronizing SQLite database with mapping.json (Source of Truth)...")
-
     try:
-        mapping_data = json.loads(mapping_path.read_text(encoding="utf-8"))
-        items = mapping_data.get("items") if isinstance(mapping_data, dict) else mapping_data
-
-        if not isinstance(items, list) or not items:
-            logger.warning("Invalid or empty mapping.json structure, skipping sync")
+        with open(mapping_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        items = data.get("items", [])
+        if not items:
+            logger.warning("No items found in mapping.json")
             return
-
-        active_skus: list[str] = []
-        upsert_payload: list[tuple[str, str, Optional[str], Optional[str], bool]] = []
-
-        for index, item in enumerate(items):
-            if not isinstance(item, dict):
-                continue
-
-            sku_internal = str(item.get("sku_internal", "")).strip()
-            if not sku_internal:
-                logger.warning("Item #%d has empty sku_internal, skipping", index)
-                continue
-
-            active_skus.append(sku_internal)
-            title = str(item.get("title", "")).strip()
-            
-            wb_barcode = item.get("wb_barcode")
-            wb_barcode = str(wb_barcode).strip() if wb_barcode is not None else None
-            
-            ozon_offer_id = item.get("ozon_offer_id")
-            ozon_offer_id = str(ozon_offer_id).strip() if ozon_offer_id is not None else None
-            
-            active = bool(item.get("active", True))
-
-            upsert_payload.append((sku_internal, title, wb_barcode, ozon_offer_id, active))
-
-        async with aiosqlite.connect(database_path) as db:
-            async with db.transaction():
-                # 1. Массовая вставка/обновление всех позиций (Bulk Upsert)
-                await db.executemany(
-                    """
-                    INSERT OR REPLACE INTO products 
-                    (sku_internal, title, wb_barcode, ozon_offer_id, active, updated_at)
-                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                    """,
-                    upsert_payload,
-                )
-
-                # 2. Безопасное каскадное отключение удаленных SKU через архитектурный паттерн Staging Table
-                if active_skus:
-                    await db.execute("CREATE TEMPORARY TABLE IF NOT EXISTS temp_active_skus (sku TEXT);")
-                    await db.execute("DELETE FROM temp_active_skus;")
-                    await db.executemany("INSERT INTO temp_active_skus (sku) VALUES (?);", [(sku,) for sku in active_skus])
-                    await db.execute("""
-                        UPDATE products 
-                        SET active = 0 
-                        WHERE sku_internal NOT IN (SELECT sku FROM temp_active_skus);
-                    """)
-                    await db.execute("DROP TABLE temp_active_skus;")
-
-        backup_path = mapping_path.with_suffix(".json.bak")
-        shutil.copy2(mapping_path, backup_path)
-        logger.info("Successfully synced %d items via temporary staging table. Backup created: %s", len(upsert_payload), backup_path)
-
+        payload = [
+            (
+                str(item["sku_internal"]).strip(),
+                str(item["wb_barcode"]).strip() if item.get("wb_barcode") else None,
+                str(item["ozon_offer_id"]).strip() if item.get("ozon_offer_id") else None,
+                bool(item.get("active", True))
+            )
+            for item in items
+        ]
+        async with aiosqlite.connect(database_path, isolation_level=None) as db:
+            async with db.in_transaction():
+                await db.execute("DELETE FROM products;")
+                await db.executemany("""
+                    INSERT INTO products (sku_internal, wb_barcode, ozon_offer_id, active)
+                    VALUES (?, ?, ?, ?);
+                """, payload)
+        logger.info("Successfully synchronized %d products from mapping.json into SQLite repository", len(payload))
     except Exception as exc:
-        logger.exception("Synchronization with mapping.json failed")
+        logger.error("Synchronization with mapping.json failed: %s", exc)
         raise DatabaseError(f"Sync failed: {exc}") from exc
 
-
-async def get_all_products(database_path: Path) -> dict[str, dict[str, Any]]:
-    result: dict[str, dict[str, Any]] = {}
+async def get_all_products(database_path: Path) -> list[DBProduct]:
+    products = []
     try:
-        async with aiosqlite.connect(database_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM products") as cursor:
-                rows = await cursor.fetchall()
-                for row in rows:
-                    sku_internal = row["sku_internal"]
-                    result[sku_internal] = {
-                        "id": row["id"],
-                        "sku_internal": row["sku_internal"],
-                        "title": row["title"],
-                        "wb_barcode": row["wb_barcode"],
-                        "ozon_offer_id": row["ozon_offer_id"],
-                        "active": bool(row["active"]),
-                    }
-    except Exception as exc:
-        logger.exception("Failed to load products from database")
-        raise DatabaseError(f"Failed to load products: {exc}") from exc
-    return result
-
-
-async def get_product_by_sku(database_path: Path, sku_internal: str) -> Optional[dict[str, Any]]:
-    try:
-        async with aiosqlite.connect(database_path) as db:
-            db.row_factory = aiosqlite.Row
+        async with aiosqlite.connect(database_path, isolation_level=None) as db:
             async with db.execute(
-                "SELECT * FROM products WHERE sku_internal = ? AND active = 1",
-                (sku_internal,),
+                "SELECT sku_internal, wb_barcode, ozon_offer_id, active FROM products WHERE active = 1;"
             ) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    return {
-                        "id": row["id"],
-                        "sku_internal": row["sku_internal"],
-                        "title": row["title"],
-                        "wb_barcode": row["wb_barcode"],
-                        "ozon_offer_id": row["ozon_offer_id"],
-                        "active": bool(row["active"]),
-                    }
-                return None
+                async for row in cursor:
+                    products.append(DBProduct(
+                        sku_internal=str(row[0]),
+                        wb_barcode=str(row[1]) if row[1] else None,
+                        ozon_offer_id=str(row[2]) if row[2] else None,
+                        active=bool(row[3])
+                    ))
+        return products
     except Exception as exc:
-        logger.exception("Failed to fetch product by SKU: %s", sku_internal)
-        raise DatabaseError(f"Database lookup failed: {exc}") from exc
-
-
-async def upsert_product(
-        database_path: Path,
-        sku_internal: str,
-        title: str = "",
-        wb_barcode: Optional[str] = None,
-        ozon_offer_id: Optional[str] = None,
-        active: bool = True,
-) -> None:
-
-    try:
-        async with aiosqlite.connect(database_path) as db:
-            async with db.transaction():
-                await db.execute(
-                    """
-                    INSERT OR REPLACE INTO products 
-                    (sku_internal, title, wb_barcode, ozon_offer_id, active, updated_at)
-                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                    """,
-                    (sku_internal, title, wb_barcode, ozon_offer_id, active),
-                )
-    except Exception as exc:
-        logger.exception("Failed to upsert product: %s", sku_internal)
-        raise DatabaseError(f"Database upsert failed: {exc}") from exc
+        logger.error("Failed to fetch products grid cache from SQLite: %s", exc)
+        raise DatabaseError(f"Failed to fetch products: {exc}") from exc
