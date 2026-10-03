@@ -24,7 +24,7 @@ class StockFileManager:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._csv_path = settings.csv_path
+        self._csv_path = Path(settings.csv_path)
         self._backup_dir = Path(settings.database_path).parent / "backups"
         self._backup_dir.mkdir(parents=True, exist_ok=True)
 
@@ -96,7 +96,11 @@ class StockFileManager:
             self, max_retries: int = 3, retry_delays: Optional[list[float]] = None
     ) -> tuple[int, pd.DataFrame]:
         if retry_delays is None:
-            retry_delays = [1.0, 3.0, 5.0]
+            retry_delays = [
+                self._settings.csv_check_interval,
+                self._settings.csv_stability_window,
+                float(self._settings.csv_wait_timeout)
+            ]
 
         while len(retry_delays) < max_retries:
             retry_delays.append(retry_delays[-1] + 2.0)
@@ -105,14 +109,17 @@ class StockFileManager:
 
         while attempt <= max_retries:
             try:
-                total_rows, df = await self._async_read_csv()
-                logger.info(
-                    "Stock file read successfully (attempt %d/%d): %d rows",
-                    attempt + 1,
-                    max_retries + 1,
-                    total_rows,
-                )
-                return total_rows, df
+                if await self._verify_file_stability():
+                    total_rows, df = await self._async_read_csv()
+                    logger.info(
+                        "Stock file read successfully (attempt %d/%d): %d rows",
+                        attempt + 1,
+                        max_retries + 1,
+                        total_rows,
+                    )
+                    return total_rows, df
+                else:
+                    raise OSError("File size is unstable (currently being modified by an external process)")
 
             except (OSError, IOError, PermissionError) as exc:
                 if attempt >= max_retries:
@@ -127,7 +134,7 @@ class StockFileManager:
 
                 delay = retry_delays[attempt]
                 logger.warning(
-                    "Stock file read failed (attempt %d/%d), retrying in %.1fs: %s",
+                    "Stock file read failed or file is unstable (attempt %d/%d), retrying in %.1fs: %s",
                     attempt + 1,
                     max_retries + 1,
                     delay,
@@ -142,6 +149,15 @@ class StockFileManager:
             except Exception as exc:
                 logger.error("Unexpected error reading stock file: %s", exc)
                 raise StockFileUnavailableError(f"Unexpected error: {exc}") from exc
+
+    async def _verify_file_stability(self) -> bool:
+        try:
+            size_init = os.path.getsize(self._csv_path)
+            await asyncio.sleep(self._settings.csv_stability_window)
+            size_final = os.path.getsize(self._csv_path)
+            return size_init == size_final
+        except OSError:
+            return False
 
     async def _async_read_csv(self) -> tuple[int, pd.DataFrame]:
         loop = asyncio.get_running_loop()
@@ -171,7 +187,6 @@ class StockFileManager:
                 return 0, pd.DataFrame(columns=["item_sku", "quantity"])
 
             final_df = pd.concat(chunk_list, ignore_index=True)
-            
             final_df = final_df.drop_duplicates(subset=["item_sku"], keep="last")
 
         except Exception as exc:

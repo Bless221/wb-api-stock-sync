@@ -19,13 +19,12 @@ class SyncScheduler:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._scheduler: AsyncIOScheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+        self._scheduler: AsyncIOScheduler = AsyncIOScheduler(timezone="UTC")
         self._stop_event = asyncio.Event()
         self._is_shutting_down = False
         self._job_func: Optional[Callable[[], Awaitable[None]]] = None
 
     def add_sync_job(self, func: Callable[[], Awaitable[None]]) -> None:
-        """Динамически регистрирует основную задачу синхронизации остатков."""
         self._job_func = func
 
     # ------------------------------------------------------------------
@@ -40,9 +39,9 @@ class SyncScheduler:
             trigger=IntervalTrigger(minutes=self._settings.sync_interval_minutes),
             id=JOB_ID,
             name="Marketplace stock synchronisation",
-            max_instances=1,
-            coalesce=True,
-            misfire_grace_time=120,
+            max_instances=1,          # Строго один экземпляр задачи одновременно
+            coalesce=True,            # Сливать пропущенные из-за лагов запуски в один
+            misfire_grace_time=300,   # Окно допуска запуска при жестких тормозах CPU/диска
             replace_existing=True,
         )
         self._scheduler.add_listener(self._on_job_problem, EVENT_JOB_ERROR | EVENT_JOB_MISSED)
@@ -67,7 +66,7 @@ class SyncScheduler:
 
         if self._scheduler and self._scheduler.running:
             self._scheduler.shutdown(wait=wait)
-            logger.info("Scheduler stopped")
+            logger.info("Scheduler background engine stopped")
         self._stop_event.set()
 
     # ------------------------------------------------------------------
@@ -82,13 +81,14 @@ class SyncScheduler:
             if asyncio.iscoroutine(res):
                 await res
         except asyncio.CancelledError:
+            logger.debug("Sync cycle job was explicitly cancelled via system loop shutdown trigger")
             raise
         except Exception as exc:
-            logger.debug("Sync cycle wrapper intercepted an error: %s", type(exc).__name__)
+            logger.error("Sync cycle execution failed inside scheduler wrapper: %s", exc)
 
     @staticmethod
     def _on_job_problem(event: JobEvent) -> None:
         if getattr(event, "exception", None) is not None:
             logger.error("APScheduler job '%s' raised an unhandled exception: %s", event.job_id, event.exception)
         else:
-            logger.warning("APScheduler job '%s' was missed or skipped due to overlap", event.job_id)
+            logger.warning("APScheduler job '%s' was missed or skipped due to internal loop overlap", event.job_id)

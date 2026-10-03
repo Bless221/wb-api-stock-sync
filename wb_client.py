@@ -25,6 +25,7 @@ class WBSyncReport:
     marketplace: str = "wildberries"
     total_items: int = 0
     sent_items: int = 0
+    rejected_items: int = 0
     failed_items: int = 0
     batches_total: int = 0
     batches_ok: int = 0
@@ -35,13 +36,13 @@ class WBSyncReport:
 
     @property
     def success(self) -> bool:
-        return self.batches_failed == 0 and not self.errors
+        return self.batches_failed == 0 and self.rejected_items == 0 and not self.errors
 
     def as_line(self) -> str:
         status = "OK" if self.success else "PARTIAL/FAIL"
         return (
-            f"[WB] {status}: sent={self.sent_items}/{self.total_items}, "
-            f"batches={self.batches_ok}/{self.batches_total}, "
+            f"[WB] {status}: updated={self.sent_items}/{self.total_items}, "
+            f"rejected={self.rejected_items}, batches={self.batches_ok}/{self.batches_total}, "
             f"429_hits={self.rate_limit_hits}, time={self.duration_seconds:.2f}s"
         )
 
@@ -104,7 +105,9 @@ class WildberriesClient:
     ) -> None:
         async with self._batch_semaphore:
             try:
-                await self._send_batch(batch, number, report)
+                response_text = await self._send_batch(batch, number, report)
+                self._parse_wb_response(response_text, batch, number, report)
+                report.batches_ok += 1
             except CriticalAPIError:
                 raise
             except Exception as exc:
@@ -118,12 +121,12 @@ class WildberriesClient:
             batch: Sequence[WBStockItem],
             number: int,
             report: WBSyncReport,
-    ) -> None:
+    ) -> str:
         payload: dict[str, Any] = {"stocks": [item.to_payload() for item in batch]}
-        url = self._settings.wb_stocks_url  # Переведено на валидный хелпер путей
+        url = self._settings.wb_stocks_url
         
         headers = {
-            "Authorization": self._settings.wb_api_token.get_secret_value(),  # Раскрытие SecretStr
+            "Authorization": self._settings.wb_api_token.get_secret_value(),
             "Content-Type": "application/json"
         }
         attempt = 0
@@ -145,10 +148,7 @@ class WildberriesClient:
 
                     if status in (200, 204):
                         await self._relax_cooldown()
-                        report.batches_ok += 1
-                        report.sent_items += len(batch)
-                        logger.info("[WB] Batch %d accepted (%d items)", number, len(batch))
-                        return
+                        return body
 
                     if status == 429:
                         report.rate_limit_hits += 1
@@ -172,6 +172,40 @@ class WildberriesClient:
                 logger.warning("[WB] Network error on batch %d, retrying in %.1fs: %s", number, delay, exc)
                 attempt += 1
                 await asyncio.sleep(delay)
+
+    def _parse_wb_response(self, response_text: str, batch: Sequence[WBStockItem], batch_number: int, report: WBSyncReport) -> None:
+
+        if not response_text.strip():
+            report.sent_items += len(batch)
+            logger.info("[WB] Batch %d accepted fully (204 No Content, %d items)", batch_number, len(batch))
+            return
+
+        try:
+            data = json.loads(response_text)
+            errors = data.get("errors", [])
+            
+            if errors and isinstance(errors, list):
+                bad_barcodes = {err.get("sku") for err in errors if err.get("sku")}
+                
+                batch_rejected = len(bad_barcodes)
+                batch_sent = max(0, len(batch) - batch_rejected)
+
+                report.sent_items += batch_sent
+                report.rejected_items += batch_rejected
+
+                for err in errors:
+                    logger.warning("[WB] SKU %s rejected by Wildberries backend: %s", err.get("sku"), err.get("message"))
+                
+                logger.warning(
+                    "[WB] Batch %d completed with warnings: updated=%d, rejected=%d", 
+                    batch_number, batch_sent, batch_rejected
+                )
+                return
+        except Exception:
+            pass
+
+        report.sent_items += len(batch)
+        logger.info("[WB] Batch %d accepted successfully (%d items)", batch_number, len(batch))
 
     async def _await_cooldown(self) -> None:
         while True:
