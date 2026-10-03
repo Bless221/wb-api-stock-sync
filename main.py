@@ -180,10 +180,11 @@ async def run_sync_cycle(
         for exc in critical_errors:
             await notifier.notify_critical_error(
                 title="🚨 CRITICAL Marketplace API Error",
-                message=f"[{exc.marketplace.upper()}] HTTP {exc.status_code} - {exc.message}. Stopping scheduler.",
+                message=f"[{exc.marketplace.upper()}] HTTP {exc.status_code} - {exc.message}.\nСервис продолжит работу и повторит попытку через {settings.sync_interval_minutes} мин.",
                 marketplace=exc.marketplace
             )
-        raise Exception("Sync loop terminated due to critical marketplace API errors")
+        # ИСПРАВЛЕНО ДЛЯ АВТОНОМНОСТИ при ошибках API маркетплейса.
+        logger.warning("Sync cycle finished with critical API errors. Application remains active in background.")
 
     if success_summaries and not critical_errors:
         await notifier.notify_sync_success(summary="\n".join(success_summaries))
@@ -241,12 +242,9 @@ async def main() -> None:
             try:
                 await sync_job()
             except Exception as exc:
+                # Защита от падения при первом запуске.
                 logger.error("Initial startup sync execution failed: %s", exc, exc_info=True)
-                if "terminated due to critical marketplace API errors" in str(exc):
-                    logger.critical("Forcing system shutdown due to failed startup verification checks")
-                    scheduler.shutdown(wait=False)
-                    await notifier.close()
-                    sys.exit(1)
+                logger.warning("Application will remain alive in background. Waiting for the next scheduled tick.")
 
         try:
             await stop_event.wait()

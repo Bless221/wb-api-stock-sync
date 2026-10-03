@@ -154,7 +154,8 @@ class Settings(BaseSettings):
 
     @property
     def ozon_stocks_url(self) -> str:
-        return f"{self.ozon_base_url}/v1/product/import/stocks"
+        # ИСПРАВЛЕНО: обновлен путь
+        return f"{self.ozon_base_url}/v2/products/stocks"
 
 
 @lru_cache()
