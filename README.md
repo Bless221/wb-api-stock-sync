@@ -839,6 +839,7 @@ Content-Type: application/json
   ```
 
 📝 Лицензия
+
 Этот проект лицензирован под MIT License — см. файл LICENSE
 
 text
@@ -857,6 +858,7 @@ copies or substantial portions of the Software.
 
 
 👨‍💻 Разработка и контрибьютинг
+
 Установка для разработки
 ```bash
 
@@ -897,7 +899,7 @@ pytest tests/ --cov=. --cov-report=html
 📞 Поддержка и контакты
 Обнаружили баг? Откройте Issue
 
-Есть вопросы? Напишите в Discussions
+Есть вопросы? 
 
 Email: kuzmaslov05@gmail.com
 
