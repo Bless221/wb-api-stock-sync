@@ -19,12 +19,10 @@ async def init_database(database_path: Path, mapping_path: Path) -> None:
     database_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        async with aiosqlite.connect(database_path) as db:
-            db.isolation_level = None
+        async with aiosqlite.connect(database_path, isolation_level=None) as db:
             await db.execute("PRAGMA journal_mode=WAL;")
             await db.execute("PRAGMA synchronous=NORMAL;")
             await db.execute("PRAGMA busy_timeout=5000;")
-
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS products (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
