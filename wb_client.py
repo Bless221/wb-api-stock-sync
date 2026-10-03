@@ -6,7 +6,6 @@ import logging
 import random
 import time
 from dataclasses import dataclass, field
-from types import TracebackType
 from typing import Any, Optional, Sequence
 
 import aiohttp
@@ -121,10 +120,10 @@ class WildberriesClient:
             report: WBSyncReport,
     ) -> None:
         payload: dict[str, Any] = {"stocks": [item.to_payload() for item in batch]}
-        url = f"https://wildberries.ru{self._settings.wb_warehouse_id}"
+        url = self._settings.wb_stocks_url  # Переведено на валидный хелпер путей
         
         headers = {
-            "Authorization": self._settings.wb_api_token,
+            "Authorization": self._settings.wb_api_token.get_secret_value(),  # Раскрытие SecretStr
             "Content-Type": "application/json"
         }
         attempt = 0
