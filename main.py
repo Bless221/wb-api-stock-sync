@@ -66,6 +66,18 @@ async def run_sync_cycle(
 
     file_manager = StockFileManager(settings)
 
+    # ИНТЕГРАЦИЯ FTP: Скачиваем свежий stocks.csv перед валидацией и маппингом
+    try:
+        await file_manager.download_from_ftp_if_enabled()
+    except StockFileError as exc:
+        logger.error("Failed to download stocks file via FTP: %s", exc)
+        await notifier.notify_critical_error(
+            title="🚨 CRITICAL: FTP Download Failed",
+            message=str(exc),
+        )
+        logger.info("=" * 80)
+        return
+
     try:
         file_manager.validate_file()
         backup_path = file_manager.create_backup()
@@ -183,8 +195,7 @@ async def run_sync_cycle(
                 message=f"[{exc.marketplace.upper()}] HTTP {exc.status_code} - {exc.message}.\nСервис продолжит работу и повторит попытку через {settings.sync_interval_minutes} мин.",
                 marketplace=exc.marketplace
             )
-        # ИСПРАВЛЕНО ДЛЯ АВТОНОМНОСТИ при ошибках API маркетплейса.
-        logger.warning("Sync cycle finished with critical API errors. Application remains active in background.")
+        logger.warning("Sync loop finished with critical errors. Application remains active.")
 
     if success_summaries and not critical_errors:
         await notifier.notify_sync_success(summary="\n".join(success_summaries))
@@ -242,9 +253,8 @@ async def main() -> None:
             try:
                 await sync_job()
             except Exception as exc:
-                # Защита от падения при первом запуске.
                 logger.error("Initial startup sync execution failed: %s", exc, exc_info=True)
-                logger.warning("Application will remain alive in background. Waiting for the next scheduled tick.")
+                logger.warning("Application will remain alive in background. Waiting for next scheduled tick.")
 
         try:
             await stop_event.wait()

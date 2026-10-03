@@ -87,6 +87,16 @@ class Settings(BaseSettings):
     max_concurrent_batches: int = Field(default=3, alias="MAX_CONCURRENT_BATCHES")
 
     # ------------------------------------------------------------------
+    # FTP / SFTP Integration
+    # ------------------------------------------------------------------
+    enable_ftp_download: bool = Field(default=False, alias="ENABLE_FTP_DOWNLOAD")
+    ftp_host: Optional[str] = Field(default=None, alias="FTP_HOST")
+    ftp_port: int = Field(default=21, alias="FTP_PORT")
+    ftp_user: Optional[str] = Field(default=None, alias="FTP_USER")
+    ftp_password: Optional[SecretStr] = Field(default=None, alias="FTP_PASSWORD")
+    ftp_remote_path: str = Field(default="stocks.csv", alias="FTP_REMOTE_PATH")
+
+    # ------------------------------------------------------------------
     # Notifications (Telegram)
     # ------------------------------------------------------------------
     telegram_bot_token: Optional[SecretStr] = Field(default=None, alias="TELEGRAM_BOT_TOKEN")
@@ -143,6 +153,12 @@ class Settings(BaseSettings):
             raise ValueError("OZON_BACKOFF_MAX must be >= OZON_BACKOFF_BASE")
         if not (self.enable_wb or self.enable_ozon):
             raise ValueError("At least one marketplace must be enabled")
+
+        # Валидация зависимостей FTP параметров
+        if self.enable_ftp_download:
+            if not self.ftp_host or not self.ftp_user or not self.ftp_password:
+                raise ValueError("FTP download is enabled, but HOST, USER or PASSWORD fields are missing")
+
         return self
 
     # ------------------------------------------------------------------
@@ -154,7 +170,7 @@ class Settings(BaseSettings):
 
     @property
     def ozon_stocks_url(self) -> str:
-        # ИСПРАВЛЕНО: обновлен путь
+        # актуальный эндпоинт v2 для Ozon Seller API
         return f"{self.ozon_base_url}/v2/products/stocks"
 
 

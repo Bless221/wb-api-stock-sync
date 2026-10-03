@@ -5,15 +5,17 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: wb-ozon-sync
+    container_name: wb-ozon-sync-v2
     restart: unless-stopped
-    
-    # Environment variables
+
+    # Подтягиваем переменные окружения из локального файла .env
     environment:
       - WB_API_TOKEN=${WB_API_TOKEN}
       - WB_WAREHOUSE_ID=${WB_WAREHOUSE_ID}
+      - WB_BASE_URL=${WB_BASE_URL}
       - OZON_CLIENT_ID=${OZON_CLIENT_ID}
       - OZON_API_KEY=${OZON_API_KEY}
+      - OZON_BASE_URL=${OZON_BASE_URL}
       - OZON_WAREHOUSE_ID=${OZON_WAREHOUSE_ID:-}
       - ENABLE_WB=${ENABLE_WB:-true}
       - ENABLE_OZON=${ENABLE_OZON:-true}
@@ -24,36 +26,28 @@ services:
       - RUN_ON_STARTUP=${RUN_ON_STARTUP:-true}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - LOG_FILE=/app/logs/sync.log
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
-      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
-    
-    # Volume mounts
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+
+    # Монтируем постоянные диски (Volumes), чтобы логи и БД жили на сервере
     volumes:
-      - ./stocks.csv:/app/stocks.csv:ro
+      - ./stocks.csv:/app/stocks.csv:rw
       - ./mapping.json:/app/mapping.json:ro
       - ./data:/app/data
       - ./logs:/app/logs
       - ./backups:/app/backups
-    
-    # Health check
-    healthcheck:
-      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
-      interval: 60s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-    
-        # Resource limits (optional)
+
+    # Ограничение ресурсов, чтобы провайдер сервера не забанил за перегрузку CPU
     deploy:
       resources:
         limits:
-          cpus: "1"
+          cpus: "1.0"
           memory: 512M
         reservations:
-          cpus: "0.5"
-          memory: 256M
+          cpus: "0.2"
+          memory: 128M
 
-    # Logging config (ИСПРАВЛЕНЫ ОТСТУПЫ)
+    # Логирование самого Docker-контейнера (защита от переполнения диска сервера)
     logging:
       driver: "json-file"
       options:

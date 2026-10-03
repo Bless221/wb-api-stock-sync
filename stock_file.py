@@ -28,6 +28,56 @@ class StockFileManager:
         self._backup_dir = Path(settings.database_path).parent / "backups"
         self._backup_dir.mkdir(parents=True, exist_ok=True)
 
+    async def download_from_ftp_if_enabled(self) -> None:
+        """Скачивает свежий файл stocks.csv с FTP сервера перед началом цикла, если включено."""
+        if not self._settings.enable_ftp_download:
+            return
+
+        if not self._settings.ftp_host or not self._settings.ftp_user or not self._settings.ftp_password:
+            logger.error("FTP download enabled, but credentials are missing in .env")
+            return
+
+        logger.info("[FTP] Начинаю скачивание свежего %s с сервера %s...", self._settings.ftp_remote_path,
+                    self._settings.ftp_host)
+        loop = asyncio.get_running_loop()
+
+        try:
+            await loop.run_in_executor(None, self._download_ftp_sync)
+            logger.info("[FTP] Файл успешно скачан и сохранен локально: %s", self._csv_path)
+        except Exception as exc:
+            logger.error("[FTP] Ошибка скачивания файла остатков: %s", exc)
+            raise StockFileError(f"FTP download failed: {exc}") from exc
+
+    def _download_ftp_sync(self) -> None:
+        """Синхронная операция скачивания, выполняемая в пуле потоков."""
+        import ftplib
+
+        # Гарантируем, что папка для скачивания существует
+        self._csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Временный файл для безопасной атомарной перезаписи (исключает повреждение данных при обрыве)
+        tmp_path = self._csv_path.with_suffix(".tmp")
+
+        try:
+            with ftplib.FTP() as ftp:
+                ftp.connect(self._settings.ftp_host, self._settings.ftp_port, timeout=15)
+                ftp.login(self._settings.ftp_user, self._settings.ftp_password.get_secret_value())
+
+                # Переключаемся в пассивный режим (критично для стабильной работы внутри Docker-контейнеров)
+                ftp.set_pasv(True)
+
+                with open(tmp_path, "wb") as local_file:
+                    ftp.retrbinary(f"RETR {self._settings.ftp_remote_path}", local_file.write)
+
+            # Атомарно заменяем старый файл новым
+            if tmp_path.exists():
+                if self._csv_path.exists():
+                    self._csv_path.unlink()
+                tmp_path.rename(self._csv_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+
     def validate_file(self) -> bool:
         if not self._csv_path.exists():
             raise StockFileError(f"Stock file not found: {self._csv_path}")
@@ -103,17 +153,20 @@ class StockFileManager:
             try:
                 if await self._verify_file_stability():
                     total_rows, df = await self._async_read_csv()
-                    logger.info("Stock file read successfully (attempt %d/%d): %d rows", attempt + 1, max_retries + 1, total_rows)
+                    logger.info("Stock file read successfully (attempt %d/%d): %d rows", attempt + 1, max_retries + 1,
+                                total_rows)
                     return total_rows, df
                 else:
                     raise OSError("File size is unstable (currently being modified by an external process)")
             except (OSError, IOError, PermissionError) as exc:
                 if attempt >= max_retries:
                     logger.error("Stock file read failed after %d attempts: %s", max_retries + 1, exc)
-                    raise StockFileUnavailableError(f"Cannot read stock file after {max_retries + 1} attempts: {exc}") from exc
+                    raise StockFileUnavailableError(
+                        f"Cannot read stock file after {max_retries + 1} attempts: {exc}") from exc
 
                 delay = retry_delays[attempt]
-                logger.warning("Stock file read failed or file is unstable (attempt %d/%d), retrying in %.1fs: %s", attempt + 1, max_retries + 1, delay, exc)
+                logger.warning("Stock file read failed or file is unstable (attempt %d/%d), retrying in %.1fs: %s",
+                               attempt + 1, max_retries + 1, delay, exc)
                 await asyncio.sleep(delay)
                 attempt += 1
             except StockFileError:
@@ -140,10 +193,10 @@ class StockFileManager:
         chunk_list = []
         try:
             with pd.read_csv(
-                self._csv_path,
-                usecols=list(REQUIRED_COLUMNS),
-                chunksize=self._settings.csv_chunk_size,
-                encoding="utf-8"
+                    self._csv_path,
+                    usecols=list(REQUIRED_COLUMNS),
+                    chunksize=self._settings.csv_chunk_size,
+                    encoding="utf-8"
             ) as reader:
                 for chunk in reader:
                     total_rows += len(chunk)
@@ -161,5 +214,6 @@ class StockFileManager:
             logger.exception("Failed to read stock file via pandas streaming: %s", self._csv_path)
             raise StockFileError(f"Pandas streaming read failed: {exc}") from exc
 
-        logger.info("Stock file processed in background thread: %d total lines parsed, %d unique SKUs loaded", total_rows, len(final_df))
+        logger.info("Stock file processed in background thread: %d total lines parsed, %d unique SKUs loaded",
+                    total_rows, len(final_df))
         return total_rows, final_df
