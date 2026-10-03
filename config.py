@@ -24,14 +24,14 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     wb_api_token: SecretStr = Field(..., description="Wildberries JWT token")
     wb_warehouse_id: int = Field(..., gt=0, description="WB seller warehouse id")
-    wb_base_url: str = Field(default="https://marketplace-api.wildberries.ru")
+    wb_base_url: str = Field(default="https://wildberries.ru")
 
     # ------------------------------------------------------------------
     # Ozon
     # ------------------------------------------------------------------
     ozon_client_id: SecretStr = Field(..., description="Ozon Client-Id header")
     ozon_api_key: SecretStr = Field(..., description="Ozon Api-Key header")
-    ozon_base_url: str = Field(default="https://api-seller.ozon.ru")
+    ozon_base_url: str = Field(default="https://ozon.ru")
     ozon_warehouse_id: Optional[int] = Field(default=None, gt=0)
 
     # ------------------------------------------------------------------
@@ -152,7 +152,7 @@ class Settings(BaseSettings):
         return self
 
     # ------------------------------------------------------------------
-    # Convenience helpers
+    # Convenience helpers (Исправлено формирование путей)
     # ------------------------------------------------------------------
     @property
     def wb_stocks_url(self) -> str:
