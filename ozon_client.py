@@ -6,7 +6,6 @@ import logging
 import random
 import time
 from dataclasses import dataclass, field
-from types import TracebackType
 from typing import Any, Optional, Sequence
 
 import aiohttp
@@ -124,11 +123,11 @@ class OzonClient:
             report: OzonSyncReport,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"stocks": [item.to_payload() for item in batch]}
-        url = "https://ozon.ru"
+        url = self._settings.ozon_stocks_url  # Переведено на хелпер путей из настроек
         
         headers = {
-            "Client-Id": self._settings.ozon_client_id,
-            "Api-Key": self._settings.ozon_api_key,
+            "Client-Id": self._settings.ozon_client_id.get_secret_value(),  # Раскрытие SecretStr
+            "Api-Key": self._settings.ozon_api_key.get_secret_value(),      # Раскрытие SecretStr
             "Content-Type": "application/json"
         }
         attempt = 0
