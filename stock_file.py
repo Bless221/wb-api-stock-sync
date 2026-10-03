@@ -7,7 +7,7 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import pandas as pd
 
@@ -48,19 +48,13 @@ class StockFileManager:
 
                 missing = REQUIRED_COLUMNS - set(reader.fieldnames)
                 if missing:
-                    raise StockFileError(
-                        f"Stock file missing required columns: {sorted(missing)}"
-                    )
+                    raise StockFileError(f"Stock file missing required columns: {sorted(missing)}")
         except UnicodeDecodeError as exc:
             raise StockFileError(f"Stock file is not UTF-8 encoded: {exc}") from exc
         except Exception as exc:
             raise StockFileError(f"Cannot read stock file header: {exc}") from exc
 
-        logger.info(
-            "Stock file validation passed: %s (%d bytes)",
-            self._csv_path,
-            file_size,
-        )
+        logger.info("Stock file validation passed: %s (%d bytes)", self._csv_path, file_size)
         return True
 
     def create_backup(self) -> Path:
@@ -84,7 +78,6 @@ class StockFileManager:
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
             )
-
             if len(backups) > BACKUP_MAX_COUNT:
                 for old_backup in backups[BACKUP_MAX_COUNT:]:
                     old_backup.unlink()
@@ -106,44 +99,23 @@ class StockFileManager:
             retry_delays.append(retry_delays[-1] + 2.0)
 
         attempt = 0
-
         while attempt <= max_retries:
             try:
                 if await self._verify_file_stability():
                     total_rows, df = await self._async_read_csv()
-                    logger.info(
-                        "Stock file read successfully (attempt %d/%d): %d rows",
-                        attempt + 1,
-                        max_retries + 1,
-                        total_rows,
-                    )
+                    logger.info("Stock file read successfully (attempt %d/%d): %d rows", attempt + 1, max_retries + 1, total_rows)
                     return total_rows, df
                 else:
                     raise OSError("File size is unstable (currently being modified by an external process)")
-
             except (OSError, IOError, PermissionError) as exc:
                 if attempt >= max_retries:
-                    logger.error(
-                        "Stock file read failed after %d attempts: %s",
-                        max_retries + 1,
-                        exc,
-                    )
-                    raise StockFileUnavailableError(
-                        f"Cannot read stock file after {max_retries + 1} attempts: {exc}"
-                    ) from exc
+                    logger.error("Stock file read failed after %d attempts: %s", max_retries + 1, exc)
+                    raise StockFileUnavailableError(f"Cannot read stock file after {max_retries + 1} attempts: {exc}") from exc
 
                 delay = retry_delays[attempt]
-                logger.warning(
-                    "Stock file read failed or file is unstable (attempt %d/%d), retrying in %.1fs: %s",
-                    attempt + 1,
-                    max_retries + 1,
-                    delay,
-                    exc,
-                )
-
+                logger.warning("Stock file read failed or file is unstable (attempt %d/%d), retrying in %.1fs: %s", attempt + 1, max_retries + 1, delay, exc)
                 await asyncio.sleep(delay)
                 attempt += 1
-
             except StockFileError:
                 raise
             except Exception as exc:
@@ -166,7 +138,6 @@ class StockFileManager:
     def _read_csv_sync(self) -> tuple[int, pd.DataFrame]:
         total_rows = 0
         chunk_list = []
-
         try:
             with pd.read_csv(
                 self._csv_path,
@@ -176,11 +147,9 @@ class StockFileManager:
             ) as reader:
                 for chunk in reader:
                     total_rows += len(chunk)
-                    
                     chunk = chunk.dropna(subset=["item_sku"])
                     chunk["item_sku"] = chunk["item_sku"].astype(str).str.strip()
                     chunk = chunk[chunk["item_sku"] != ""]
-                    
                     chunk_list.append(chunk)
 
             if not chunk_list:
@@ -188,14 +157,9 @@ class StockFileManager:
 
             final_df = pd.concat(chunk_list, ignore_index=True)
             final_df = final_df.drop_duplicates(subset=["item_sku"], keep="last")
-
         except Exception as exc:
             logger.exception("Failed to read stock file via pandas streaming: %s", self._csv_path)
             raise StockFileError(f"Pandas streaming read failed: {exc}") from exc
 
-        logger.info(
-            "Stock file processed in background thread: %d total lines parsed, %d unique SKUs loaded",
-            total_rows,
-            len(final_df),
-        )
+        logger.info("Stock file processed in background thread: %d total lines parsed, %d unique SKUs loaded", total_rows, len(final_df))
         return total_rows, final_df

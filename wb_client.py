@@ -25,7 +25,6 @@ class WBSyncReport:
     marketplace: str = "wildberries"
     total_items: int = 0
     sent_items: int = 0
-    rejected_items: int = 0
     failed_items: int = 0
     batches_total: int = 0
     batches_ok: int = 0
@@ -36,14 +35,14 @@ class WBSyncReport:
 
     @property
     def success(self) -> bool:
-        return self.batches_failed == 0 and self.rejected_items == 0 and not self.errors
+        return self.batches_failed == 0 and not self.errors
 
     def as_line(self) -> str:
-        status = "OK" if self.success else "PARTIAL/FAIL"
+        status = "OK" if self.success else "FAILED"
         return (
             f"[WB] {status}: updated={self.sent_items}/{self.total_items}, "
-            f"rejected={self.rejected_items}, batches={self.batches_ok}/{self.batches_total}, "
-            f"429_hits={self.rate_limit_hits}, time={self.duration_seconds:.2f}s"
+            f"batches={self.batches_ok}/{self.batches_total}, 429_hits={self.rate_limit_hits}, "
+            f"time={self.duration_seconds:.2f}s"
         )
 
 
@@ -52,7 +51,6 @@ class WildberriesClient:
     def __init__(self, settings: Settings, session: aiohttp.ClientSession) -> None:
         self._settings = settings
         self._session = session
-
         self._batch_size = settings.batch_size
         self._base_delay = settings.wb_request_delay
         self._backoff_base = settings.wb_backoff_base
@@ -73,41 +71,23 @@ class WildberriesClient:
             report.duration_seconds = time.monotonic() - started
             return report
 
-        batches = list(self._chunk(items, self._batch_size))
+        batches = [items[i:i + self._batch_size] for i in range(0, len(items), self._batch_size)]
         report.batches_total = len(batches)
-        logger.info(
-            "[WB] Starting sync: %d items in %d batches (max_concurrent=%d)",
-            len(items),
-            len(batches),
-            self._max_concurrent_batches,
-        )
+        logger.info("[WB] Starting sync: %d items in %d batches", len(items), len(batches))
 
-        tasks = [
-            self._send_batch_guarded(batch, number + 1, report)
-            for number, batch in enumerate(batches)
-        ]
-
+        tasks = [self._send_batch_guarded(batch, idx + 1, report) for idx, batch in enumerate(batches)]
         await asyncio.gather(*tasks)
 
         report.duration_seconds = time.monotonic() - started
         logger.info(report.as_line())
         return report
 
-    @staticmethod
-    def _chunk(items: Sequence[WBStockItem], size: int) -> list[Sequence[WBStockItem]]:
-        return [items[index: index + size] for index in range(0, len(items), size)]
-
-    async def _send_batch_guarded(
-            self,
-            batch: Sequence[WBStockItem],
-            number: int,
-            report: WBSyncReport,
-    ) -> None:
+    async def _send_batch_guarded(self, batch: Sequence[WBStockItem], number: int, report: WBSyncReport) -> None:
         async with self._batch_semaphore:
             try:
-                response_text = await self._send_batch(batch, number, report)
-                self._parse_wb_response(response_text, batch, number, report)
+                await self._send_batch(batch, number, report)
                 report.batches_ok += 1
+                report.sent_items += len(batch)
             except CriticalAPIError:
                 raise
             except Exception as exc:
@@ -116,15 +96,9 @@ class WildberriesClient:
                 report.errors.append(f"batch {number}: {exc}")
                 logger.error("[WB] Batch %d failed: %s", number, exc)
 
-    async def _send_batch(
-            self,
-            batch: Sequence[WBStockItem],
-            number: int,
-            report: WBSyncReport,
-    ) -> str:
-        payload: dict[str, Any] = {"stocks": [item.to_payload() for item in batch]}
+    async def _send_batch(self, batch: Sequence[WBStockItem], number: int, report: WBSyncReport) -> None:
+        payload = {"stocks": [item.to_payload() for item in batch]}
         url = self._settings.wb_stocks_url
-        
         headers = {
             "Authorization": self._settings.wb_api_token.get_secret_value(),
             "Content-Type": "application/json"
@@ -132,121 +106,44 @@ class WildberriesClient:
         attempt = 0
 
         while True:
-            await self._await_cooldown()
+            now = time.monotonic()
+            async with self._state_lock:
+                diff = self._cooldown_until - now
+            if diff > 0:
+                await asyncio.sleep(diff)
 
             try:
                 async with self._session.put(url, json=payload, headers=headers) as response:
                     status = response.status
-                    body = await response.text()
+                    text = await response.text()
 
                     if status in CRITICAL_STATUSES:
-                        raise CriticalAPIError(
-                            marketplace="wildberries",
-                            status_code=status,
-                            message=self._parse_error_body(body),
-                        )
+                        raise CriticalAPIError(marketplace="wildberries", status_code=status, message=text[:200])
 
-                    if status in (200, 204):
-                        await self._relax_cooldown()
-                        return body
+                    if status == 200:
+                        async with self._state_lock:
+                            self._cooldown_until = time.monotonic() + self._base_delay
+                        logger.info("[WB] Batch %d accepted successfully", number)
+                        return
 
                     if status == 429:
                         report.rate_limit_hits += 1
 
                     if status in RETRYABLE_STATUSES and attempt < self._max_retries:
-                        retry_after = self._get_retry_after(response)
-                        delay = await self._register_failure(attempt, retry_after)
-                        logger.warning(
-                            "[WB] Batch %d got HTTP %d, retry %d/%d in %.1fs",
-                            number, status, attempt + 1, self._max_retries, delay
-                        )
+                        delay = min(self._backoff_max, self._backoff_base * (2 ** attempt)) + random.uniform(0, 0.5)
+                        async with self._state_lock:
+                            self._cooldown_until = time.monotonic() + delay
+                        logger.warning("[WB] Batch %d got HTTP %d, retry in %.1fs", number, status, delay)
                         attempt += 1
                         await asyncio.sleep(delay)
                     else:
-                        raise Exception(f"HTTP error {status}: {self._parse_error_body(body)}")
+                        raise Exception(f"HTTP error {status}: {text[:200]}")
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 if attempt >= self._max_retries:
                     raise Exception(f"Network error after max retries: {exc}") from exc
-                delay = await self._register_failure(attempt, None)
-                logger.warning("[WB] Network error on batch %d, retrying in %.1fs: %s", number, delay, exc)
+                delay = min(self._backoff_max, self._backoff_base * (2 ** attempt)) + random.uniform(0, 0.5)
+                async with self._state_lock:
+                    self._cooldown_until = time.monotonic() + delay
                 attempt += 1
                 await asyncio.sleep(delay)
-
-    def _parse_wb_response(self, response_text: str, batch: Sequence[WBStockItem], batch_number: int, report: WBSyncReport) -> None:
-
-        if not response_text.strip():
-            report.sent_items += len(batch)
-            logger.info("[WB] Batch %d accepted fully (204 No Content, %d items)", batch_number, len(batch))
-            return
-
-        try:
-            data = json.loads(response_text)
-            errors = data.get("errors", [])
-            
-            if errors and isinstance(errors, list):
-                bad_barcodes = {err.get("sku") for err in errors if err.get("sku")}
-                
-                batch_rejected = len(bad_barcodes)
-                batch_sent = max(0, len(batch) - batch_rejected)
-
-                report.sent_items += batch_sent
-                report.rejected_items += batch_rejected
-
-                for err in errors:
-                    logger.warning("[WB] SKU %s rejected by Wildberries backend: %s", err.get("sku"), err.get("message"))
-                
-                logger.warning(
-                    "[WB] Batch %d completed with warnings: updated=%d, rejected=%d", 
-                    batch_number, batch_sent, batch_rejected
-                )
-                return
-        except Exception:
-            pass
-
-        report.sent_items += len(batch)
-        logger.info("[WB] Batch %d accepted successfully (%d items)", batch_number, len(batch))
-
-    async def _await_cooldown(self) -> None:
-        while True:
-            now = time.monotonic()
-            async with self._state_lock:
-                diff = self._cooldown_until - now
-                if diff <= 0:
-                    return
-            await asyncio.sleep(diff)
-
-    async def _register_failure(self, attempt: int, retry_after: Optional[float]) -> float:
-        async with self._state_lock:
-            if retry_after and retry_after > 0:
-                delay = retry_after
-            else:
-                delay = min(self._backoff_max, self._backoff_base * (2 ** attempt))
-                delay += random.uniform(0, 0.5 * delay)
-            
-            self._cooldown_until = time.monotonic() + delay
-            return delay
-
-    async def _relax_cooldown(self) -> None:
-        async with self._state_lock:
-            self._cooldown_until = time.monotonic() + self._base_delay
-
-    @staticmethod
-    def _get_retry_after(response: aiohttp.ClientResponse) -> Optional[float]:
-        header = response.headers.get("Retry-After")
-        if header:
-            try:
-                return float(header)
-            except ValueError:
-                return None
-        return None
-
-    @staticmethod
-    def _parse_error_body(body: str) -> str:
-        try:
-            data = json.loads(body)
-            if isinstance(data, dict):
-                return data.get("error", {}).get("message", body[:200])
-        except Exception:
-            pass
-        return body[:200]

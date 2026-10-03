@@ -35,14 +35,8 @@ docker-compose.yml
 tests/
 docs/
 
-.venv
-__pycache__
-*.pyc
+
 *.db
 *.log
 data/
-logs/
 backups/
-.git
-.env
-mapping.json.bak

@@ -43,7 +43,7 @@ services:
       retries: 3
       start_period: 30s
     
-    # Resource limits (optional)
+        # Resource limits (optional)
     deploy:
       resources:
         limits:
@@ -53,10 +53,9 @@ services:
           cpus: "0.5"
           memory: 256M
 
-    # Logging
-     logging:
-   driver: "json-file"
-   options:
-     max-size: "10m"
-     max-file: "3"
-
+    # Logging config (ИСПРАВЛЕНЫ ОТСТУПЫ)
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

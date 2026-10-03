@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -11,7 +11,6 @@ BASE_DIR: Path = Path(__file__).resolve().parent
 
 
 class Settings(BaseSettings):
-
     model_config = SettingsConfigDict(
         env_file=BASE_DIR / ".env",
         env_file_encoding="utf-8",
@@ -22,89 +21,91 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Wildberries
     # ------------------------------------------------------------------
-    wb_api_token: SecretStr = Field(..., description="Wildberries JWT token")
-    wb_warehouse_id: int = Field(..., gt=0, description="WB seller warehouse id")
-    wb_base_url: str = Field(default="https://wildberries.ru")
+    wb_api_token: SecretStr = Field(..., alias="WB_API_TOKEN")
+    wb_warehouse_id: int = Field(..., gt=0, alias="WB_WAREHOUSE_ID")
+    wb_base_url: str = Field(default="https://wildberries.ru", alias="WB_BASE_URL")
 
     # ------------------------------------------------------------------
     # Ozon
     # ------------------------------------------------------------------
-    ozon_client_id: SecretStr = Field(..., description="Ozon Client-Id header")
-    ozon_api_key: SecretStr = Field(..., description="Ozon Api-Key header")
-    ozon_base_url: str = Field(default="https://ozon.ru")
-    ozon_warehouse_id: Optional[int] = Field(default=None, gt=0)
+    ozon_client_id: SecretStr = Field(..., alias="OZON_CLIENT_ID")
+    ozon_api_key: SecretStr = Field(..., alias="OZON_API_KEY")
+    ozon_base_url: str = Field(default="https://ozon.ru", alias="OZON_BASE_URL")
+    ozon_warehouse_id: Optional[int] = Field(default=None, alias="OZON_WAREHOUSE_ID")
 
     # ------------------------------------------------------------------
-    # Marketplace toggles (commercial tiers)
+    # Marketplace toggles
     # ------------------------------------------------------------------
-    enable_wb: bool = Field(default=True)
-    enable_ozon: bool = Field(default=True)
+    enable_wb: bool = Field(default=True, alias="ENABLE_WB")
+    enable_ozon: bool = Field(default=True, alias="ENABLE_OZON")
 
     # ------------------------------------------------------------------
     # Data sources
     # ------------------------------------------------------------------
-    csv_path: Path = Field(default=Path("stocks.csv"))
-    mapping_path: Path = Field(default=Path("mapping.json"))
-    database_path: Path = Field(default=Path("data/stocks.db"))
+    csv_path: Path = Field(default=Path("stocks.csv"), alias="CSV_PATH")
+    mapping_path: Path = Field(default=Path("mapping.json"), alias="MAPPING_PATH")
+    database_path: Path = Field(default=Path("data/stocks.db"), alias="DATABASE_PATH")
 
     # ------------------------------------------------------------------
     # Batching and rate limits
     # ------------------------------------------------------------------
-    batch_size: int = Field(default=100, ge=1, le=1000)
+    batch_size: int = Field(default=100, ge=1, alias="BATCH_SIZE")
 
-    wb_request_delay: float = Field(default=1.0, ge=0.0, le=60.0)
-    ozon_request_delay: float = Field(default=0.8, ge=0.0, le=60.0)
+    wb_request_delay: float = Field(default=1.0, alias="WB_REQUEST_DELAY")
+    ozon_request_delay: float = Field(default=0.8, alias="OZON_REQUEST_DELAY")
 
-    wb_backoff_base: float = Field(default=2.0, gt=0.0)
-    wb_backoff_max: float = Field(default=120.0, gt=0.0)
-    wb_max_retries: int = Field(default=5, ge=0, le=15)
+    wb_backoff_base: float = Field(default=2.0, alias="WB_BACKOFF_BASE")
+    wb_backoff_max: float = Field(default=120.0, alias="WB_BACKOFF_MAX")
+    wb_max_retries: int = Field(default=5, alias="WB_MAX_RETRIES")
 
-    ozon_backoff_base: float = Field(default=2.0, gt=0.0)
-    ozon_backoff_max: float = Field(default=120.0, gt=0.0)
-    ozon_max_retries: int = Field(default=5, ge=0, le=15)
+    ozon_backoff_base: float = Field(default=2.0, alias="OZON_BACKOFF_BASE")
+    ozon_backoff_max: float = Field(default=120.0, alias="OZON_BACKOFF_MAX")
+    ozon_max_retries: int = Field(default=5, alias="OZON_MAX_RETRIES")
 
     # ------------------------------------------------------------------
     # Networking and scheduling
     # ------------------------------------------------------------------
-    request_timeout: int = Field(default=30, ge=1, le=300)
-    sync_interval_minutes: int = Field(default=15, ge=1, le=1440)
-    run_on_startup: bool = Field(default=True)
+    request_timeout: int = Field(default=30, alias="REQUEST_TIMEOUT")
+    sync_interval_minutes: int = Field(default=15, alias="SYNC_INTERVAL_MINUTES")
+    run_on_startup: bool = Field(default=True, alias="RUN_ON_STARTUP")
 
     # ------------------------------------------------------------------
     # File stability checking
     # ------------------------------------------------------------------
-    csv_wait_timeout: int = Field(default=10, ge=1, le=300)
-    csv_stability_window: int = Field(default=2, ge=1, le=10)
-    csv_check_interval: float = Field(default=1.0, ge=0.1, le=5.0)
+    csv_wait_timeout: int = Field(default=10, alias="CSV_WAIT_TIMEOUT")
+    csv_stability_window: int = Field(default=2, alias="CSV_STABILITY_WINDOW")
+    csv_check_interval: float = Field(default=1.0, alias="CSV_CHECK_INTERVAL")
 
     # ------------------------------------------------------------------
     # Streaming chunk size
     # ------------------------------------------------------------------
-    csv_chunk_size: int = Field(default=10000, ge=1000, le=100000)
+    csv_chunk_size: int = Field(default=10000, alias="CSV_CHUNK_SIZE")
 
     # ------------------------------------------------------------------
     # Parallel batch settings
     # ------------------------------------------------------------------
-    max_concurrent_batches: int = Field(default=3, ge=1, le=10)
+    max_concurrent_batches: int = Field(default=3, alias="MAX_CONCURRENT_BATCHES")
 
     # ------------------------------------------------------------------
     # Notifications (Telegram)
     # ------------------------------------------------------------------
-    telegram_bot_token: Optional[SecretStr] = Field(default=None)
-    telegram_chat_id: Optional[str] = Field(default=None)
+    telegram_bot_token: Optional[SecretStr] = Field(default=None, alias="TELEGRAM_BOT_TOKEN")
+    telegram_chat_id: Optional[str] = Field(default=None, alias="TELEGRAM_CHAT_ID")
 
     # ------------------------------------------------------------------
     # Logging
     # ------------------------------------------------------------------
-    log_level: str = Field(default="INFO")
-    log_file: Path = Field(default=Path("logs/sync.log"))
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    log_file: Path = Field(default=Path("logs/sync.log"), alias="LOG_FILE")
 
     # ------------------------------------------------------------------
     # Validators
     # ------------------------------------------------------------------
-    @field_validator("wb_base_url", "ozon_base_url")
+    @field_validator("wb_base_url", "ozon_base_url", mode="before")
     @classmethod
-    def _strip_trailing_slash(cls, value: str) -> str:
+    def _strip_trailing_slash(cls, value: Any) -> str:
+        if not isinstance(value, str):
+            return str(value)
         value = value.strip().rstrip("/")
         if not value.startswith(("http://", "https://")):
             raise ValueError("Base URL must start with http:// or https://")
@@ -119,17 +120,20 @@ class Settings(BaseSettings):
             raise ValueError(f"LOG_LEVEL must be one of {sorted(allowed)}")
         return normalized
 
-    @field_validator("csv_path", "mapping_path", "log_file", "database_path")
+    @field_validator("csv_path", "mapping_path", "log_file", "database_path", mode="before")
     @classmethod
-    def _resolve_path(cls, value: Path) -> Path:
-        return value if value.is_absolute() else (BASE_DIR / value)
+    def _resolve_path(cls, value: Any) -> Path:
+        p = Path(value)
+        return p if p.is_absolute() else (BASE_DIR / p)
 
-    @field_validator("wb_api_token", "ozon_api_key", "ozon_client_id")
+    @field_validator("ozon_warehouse_id", mode="before")
     @classmethod
-    def _reject_empty_secret(cls, value: SecretStr) -> SecretStr:
-        if not value.get_secret_value().strip():
-            raise ValueError("Credential must not be empty")
-        return value
+    def _empty_string_to_none(cls, value: Any) -> Optional[int]:
+        if isinstance(value, str) and not value.strip():
+            return None
+        if value is None:
+            return None
+        return int(value)
 
     @model_validator(mode="after")
     def _validate_backoff_bounds(self) -> "Settings":
@@ -139,20 +143,10 @@ class Settings(BaseSettings):
             raise ValueError("OZON_BACKOFF_MAX must be >= OZON_BACKOFF_BASE")
         if not (self.enable_wb or self.enable_ozon):
             raise ValueError("At least one marketplace must be enabled")
-        if self.telegram_bot_token and not self.telegram_bot_token.get_secret_value().strip():
-            self.telegram_bot_token = None
-        if self.telegram_chat_id and not self.telegram_chat_id.strip():
-            self.telegram_chat_id = None
-
-        has_token = self.telegram_bot_token is not None
-        has_chat_id = self.telegram_chat_id is not None
-        if has_token != has_chat_id:
-            raise ValueError("Both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be provided together")
-
         return self
 
     # ------------------------------------------------------------------
-    # Convenience helpers (Исправлено формирование путей)
+    # Convenience helpers
     # ------------------------------------------------------------------
     @property
     def wb_stocks_url(self) -> str:
@@ -165,5 +159,4 @@ class Settings(BaseSettings):
 
 @lru_cache()
 def get_settings() -> Settings:
-    """Возвращает кэшированный синглтон настроек приложения."""
     return Settings()

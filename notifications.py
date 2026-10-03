@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Optional
+from typing import Optional, Any
 
 import aiohttp
 
 from config import Settings
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("stock_sync")
 
 
 class TelegramNotifier:
@@ -18,7 +18,7 @@ class TelegramNotifier:
         self._settings = settings
         self._session = session
         self._owns_session = session is None
-        self._base_url = "https://api.telegram.org"
+        self._base_url = "https://telegram.org"
         self._has_alerts = settings.telegram_bot_token is not None and settings.telegram_chat_id is not None
 
         if not self._has_alerts:

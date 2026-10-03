@@ -20,7 +20,7 @@ RETRYABLE_STATUSES: frozenset[int] = frozenset({408, 425, 429, 500, 502, 503, 50
 CRITICAL_STATUSES: frozenset[int] = frozenset({401, 403, 400})
 
 
-@dataclass(slots=True)
+@dataclass
 class OzonSyncReport:
     marketplace: str = "ozon"
     total_items: int = 0
@@ -124,7 +124,7 @@ class OzonClient:
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"stocks": [item.to_payload() for item in batch]}
         url = self._settings.ozon_stocks_url
-        
+
         headers = {
             "Client-Id": self._settings.ozon_client_id.get_secret_value(),
             "Api-Key": self._settings.ozon_api_key.get_secret_value(),
@@ -209,7 +209,7 @@ class OzonClient:
         for item in results:
             if not isinstance(item, dict):
                 continue
-            
+
             if item.get("updated", False):
                 batch_sent += 1
             else:
@@ -219,15 +219,17 @@ class OzonClient:
                 if isinstance(errors, dict):
                     err_msg = errors.get("message", "Unknown error")
                 elif isinstance(errors, list) and errors:
-                    err_msg = errors[0].get("message", "Unknown error") if isinstance(errors[0], dict) else str(errors[0])
-                
+                    err_msg = errors[0].get("message", "Unknown error") if isinstance(errors[0], dict) else str(
+                        errors[0])
+
                 logger.warning("[OZON] SKU %s rejected: %s", item.get("offer_id"), err_msg)
 
         report.sent_items += batch_sent
         report.rejected_items += batch_rejected
-        
+
         if batch_rejected > 0:
-            logger.warning("[OZON] Batch %d partial success: updated=%d, rejected=%d", batch_number, batch_sent, batch_rejected)
+            logger.warning("[OZON] Batch %d partial success: updated=%d, rejected=%d", batch_number, batch_sent,
+                           batch_rejected)
         else:
             logger.info("[OZON] Batch %d accepted successfully (%d items)", batch_number, batch_sent)
 
@@ -253,7 +255,6 @@ class OzonClient:
         try:
             data = json.loads(body)
             if isinstance(data, dict):
-                # Ozon API v2/v3 отдает ошибку либо в корневом message, либо в объекте error
                 if "message" in data:
                     return str(data["message"])
                 elif "error" in data and isinstance(data["error"], dict):

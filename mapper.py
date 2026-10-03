@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 import pandas as pd
 
-from database import DatabaseError, get_all_products
+from database import DatabaseError, get_all_products, DBProduct
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +19,7 @@ class MappingError(Exception):
     pass
 
 
-# ----------------------------------------------------------------------
-# Marketplace payload models
-# ----------------------------------------------------------------------
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class WBStockItem:
     sku: str
     amount: int
@@ -31,7 +28,7 @@ class WBStockItem:
         return {"sku": self.sku, "amount": self.amount}
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class OzonStockItem:
     offer_id: str
     stock: int
@@ -44,7 +41,7 @@ class OzonStockItem:
         return payload
 
 
-@dataclass(slots=True)
+@dataclass
 class MappingResult:
     wb_items: list[WBStockItem] = field(default_factory=list)
     ozon_items: list[OzonStockItem] = field(default_factory=list)
@@ -61,21 +58,14 @@ class MappingResult:
         )
 
 
-# ----------------------------------------------------------------------
-# Mapper with SQLite backend and in-memory cache
-# ----------------------------------------------------------------------
 class ProductMapper:
 
-    def __init__(
-            self,
-            database_path: Path,
-            ozon_warehouse_id: Optional[int] = None,
-    ) -> None:
+    def __init__(self, database_path: Path, ozon_warehouse_id: Optional[int] = None) -> None:
         self._database_path = Path(database_path)
         self._ozon_warehouse_id = ozon_warehouse_id
-        self._cache: dict[str, dict[str, Any]] = {}
-        self._reverse_cache_wb: dict[str, str] = {}  # barcode -> sku_internal
-        self._reverse_cache_ozon: dict[str, str] = {}  # offer_id -> sku_internal
+        self._cache: dict[str, DBProduct] = {}
+        self._reverse_cache_wb: dict[str, str] = {}
+        self._reverse_cache_ozon: dict[str, str] = {}
 
     async def load(self) -> None:
         try:
@@ -88,12 +78,12 @@ class ProductMapper:
         self._reverse_cache_ozon.clear()
 
         for sku_internal, product in products.items():
-            if product.get("active"):
-                wb_bc = product.get("wb_barcode")
+            if product.active:
+                wb_bc = product.wb_barcode
                 if wb_bc:
                     self._reverse_cache_wb[str(wb_bc).strip()] = sku_internal
-                
-                ozon_id = product.get("ozon_offer_id")
+
+                ozon_id = product.ozon_offer_id
                 if ozon_id:
                     self._reverse_cache_ozon[str(ozon_id).strip()] = sku_internal
 
@@ -104,26 +94,12 @@ class ProductMapper:
             len(self._reverse_cache_ozon),
         )
 
-    # ------------------------------------------------------------------
-    # Introspection
-    # ------------------------------------------------------------------
     def __len__(self) -> int:
         return len(self._cache)
 
-    def get_by_sku(self, sku_internal: str) -> Optional[dict[str, Any]]:
+    def get_by_sku(self, sku_internal: str) -> Optional[DBProduct]:
         return self._cache.get(sku_internal)
 
-    def get_by_wb_barcode(self, barcode: str) -> Optional[dict[str, Any]]:
-        sku_internal = self._reverse_cache_wb.get(str(barcode).strip())
-        return self._cache.get(sku_internal) if sku_internal else None
-
-    def get_by_ozon_offer_id(self, offer_id: str) -> Optional[dict[str, Any]]:
-        sku_internal = self._reverse_cache_ozon.get(str(offer_id).strip())
-        return self._cache.get(sku_internal) if sku_internal else None
-
-    # ------------------------------------------------------------------
-    # Core translation (vectorized for DataFrames)
-    # ------------------------------------------------------------------
     def map_dataframe(self, df: pd.DataFrame) -> MappingResult:
         self._validate_frame(df)
         result = MappingResult()
@@ -132,16 +108,9 @@ class ProductMapper:
             return result
 
         initial_rows = len(df)
-
         df = df.copy()
         df[SKU_COLUMN] = df[SKU_COLUMN].astype(str).str.strip()
-        df = df[df[SKU_COLUMN] != ""]
         df = df.dropna(subset=[SKU_COLUMN, QTY_COLUMN])
-
-        valid_rows = len(df)
-        invalid_count = initial_rows - valid_rows
-        if invalid_count > 0:
-            logger.info("Dropped %d rows with null/empty SKU or quantity", invalid_count)
 
         df[QTY_COLUMN] = pd.to_numeric(df[QTY_COLUMN], errors="coerce")
         df = df.dropna(subset=[QTY_COLUMN])
@@ -151,22 +120,9 @@ class ProductMapper:
         if negative_mask.any():
             invalid_skus = df[negative_mask][SKU_COLUMN].tolist()
             result.invalid_rows.extend(invalid_skus)
-            logger.warning("Found %d rows with negative quantities, moving to invalid", len(invalid_skus))
             df = df[~negative_mask]
 
-        coerced_rows = len(df)
-        if coerced_rows < valid_rows:
-            logger.info(
-                "Dropped %d rows with non-numeric quantity format",
-                valid_rows - coerced_rows,
-            )
-
         df = df.drop_duplicates(subset=[SKU_COLUMN], keep="last")
-        deduped_rows = len(df)
-        if deduped_rows < coerced_rows:
-            logger.info(
-                "Deduplicated %d duplicate SKUs, keeping last written sync value", coerced_rows - deduped_rows
-            )
 
         for row in df.itertuples(index=False):
             sku_internal = str(getattr(row, SKU_COLUMN)).strip()
@@ -177,17 +133,15 @@ class ProductMapper:
                 result.unknown_skus.append(sku_internal)
                 continue
 
-            if not product.get("active", False):
+            if not product.active:
                 result.inactive_skus.append(sku_internal)
                 continue
 
-            wb_bc = product.get("wb_barcode")
+            wb_bc = product.wb_barcode
             if wb_bc and str(wb_bc).strip().lower() != "none":
-                result.wb_items.append(
-                    WBStockItem(sku=str(wb_bc).strip(), amount=quantity)
-                )
+                result.wb_items.append(WBStockItem(sku=str(wb_bc).strip(), amount=quantity))
 
-            ozon_id = product.get("ozon_offer_id")
+            ozon_id = product.ozon_offer_id
             if ozon_id and str(ozon_id).strip().lower() != "none":
                 result.ozon_items.append(
                     OzonStockItem(
@@ -197,26 +151,10 @@ class ProductMapper:
                     )
                 )
 
-        if result.unknown_skus:
-            logger.warning(
-                "Unmapped SKUs skipped (%d): %s",
-                len(result.unknown_skus),
-                ", ".join(result.unknown_skus[:15]),
-            )
-        if result.inactive_skus:
-            logger.info("Inactive products skipped from syncing: %d", len(result.inactive_skus))
-
-        logger.info("Mapping result tracking report: %s (from %d raw CSV rows)", result.summary, initial_rows)
         return result
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
     @staticmethod
     def _validate_frame(df: pd.DataFrame) -> None:
         missing = [column for column in (SKU_COLUMN, QTY_COLUMN) if column not in df.columns]
         if missing:
-            raise MappingError(
-                f"Stock file data structure must contain columns {SKU_COLUMN!r} and {QTY_COLUMN!r}; "
-                f"missing structure error fields: {missing}"
-            )
+            raise MappingError(f"Stock file missing fields: {missing}")
