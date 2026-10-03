@@ -1,14 +1,15 @@
 version: "3.9"
 
 services:
+  # асинхронный робот синхронизации
   sync-daemon:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: wb-ozon-sync-v2
     restart: unless-stopped
-
-    # Подтягиваем переменные окружения из локального файла .env
+    depends_on:
+      - ftp-server # Робот дождется старта FTP-сервера
     environment:
       - WB_API_TOKEN=${WB_API_TOKEN}
       - WB_WAREHOUSE_ID=${WB_WAREHOUSE_ID}
@@ -28,28 +29,51 @@ services:
       - LOG_FILE=/app/logs/sync.log
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
-
-    # Монтируем постоянные диски (Volumes), чтобы логи и БД жили на сервере
+      # Настройки подключения к нашему FTP внутри сети Docker
+      - ENABLE_FTP_DOWNLOAD=true
+      - FTP_HOST=ftp-server  # Имя Docker-сервиса (работает внутренний DNS Docker)
+      - FTP_PORT=21
+      - FTP_USER=${FTP_USER:-ftp_1c_user}
+      - FTP_PASSWORD=${FTP_PASSWORD:-secret_ftp_pass_2026}
+      - FTP_REMOTE_PATH=stocks.csv
     volumes:
+      # Важно: монтируем stocks.csv как файл или используем общую папку
+      - shared-ftp-data:/app/ftp_data
       - ./stocks.csv:/app/stocks.csv:rw
       - ./mapping.json:/app/mapping.json:ro
       - ./data:/app/data
       - ./logs:/app/logs
       - ./backups:/app/backups
-
-    # Ограничение ресурсов, чтобы провайдер сервера не забанил за перегрузку CPU
     deploy:
       resources:
         limits:
           cpus: "1.0"
           memory: 512M
-        reservations:
-          cpus: "0.2"
-          memory: 128M
 
-    # Логирование самого Docker-контейнера (защита от переполнения диска сервера)
+  # Автономный встроенный FTP-сервер для 1С
+  ftp-server:
+    image: delfer/alpine-ftp-server:latest
+    container_name: ftp-server-v2
+    restart: unless-stopped
+    # Пробрасываем порты наружу, чтобы 1С огла достучаться
+    ports:
+      - "21:21"
+      - "21000-21010:21000-21010" # Диапазон портов для пассивного режима (PASV)
+    environment:
+      - FTP_USER=${FTP_USER:-ftp_1c_user}
+      - FTP_PASS=${FTP_PASSWORD:-secret_ftp_pass_2026}
+      # Задаем диапазон портов для пассивного режима, чтобы не блокировал файрвол
+      - MIN_PORT=21000
+      - MAX_PORT=21010
+    volumes:
+      # Папка, куда попадают загруженные файлы
+      - shared-ftp-data:/ftp/ftp_1c_user
     logging:
       driver: "json-file"
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "5m"
+        max-file: "2"
+
+# Общий изолированный диск Docker для мгновенного обмена файлами
+volumes:
+  shared-ftp-data:

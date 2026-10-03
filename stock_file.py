@@ -29,51 +29,48 @@ class StockFileManager:
         self._backup_dir.mkdir(parents=True, exist_ok=True)
 
     async def download_from_ftp_if_enabled(self) -> None:
-        """Скачивает свежий файл stocks.csv с FTP сервера перед началом цикла, если включено."""
+        """Импортирует свежий файл остатков из общей папки FTP-сервера Docker перед началом цикла."""
         if not self._settings.enable_ftp_download:
             return
 
-        if not self._settings.ftp_host or not self._settings.ftp_user or not self._settings.ftp_password:
-            logger.error("FTP download enabled, but credentials are missing in .env")
-            return
-
-        logger.info("[FTP] Начинаю скачивание свежего %s с сервера %s...", self._settings.ftp_remote_path,
-                    self._settings.ftp_host)
+        logger.info("[FTP/Storage] Начинаю импорт свежего файла %s из общего Docker-тома...",
+                    self._settings.ftp_remote_path)
         loop = asyncio.get_running_loop()
 
         try:
             await loop.run_in_executor(None, self._download_ftp_sync)
-            logger.info("[FTP] Файл успешно скачан и сохранен локально: %s", self._csv_path)
         except Exception as exc:
-            logger.error("[FTP] Ошибка скачивания файла остатков: %s", exc)
-            raise StockFileError(f"FTP download failed: {exc}") from exc
+            logger.error("[FTP/Storage] Ошибка импорта файла остатков: %s", exc)
+            raise StockFileError(f"FTP shared import failed: {exc}") from exc
 
     def _download_ftp_sync(self) -> None:
-        """Синхронная операция скачивания, выполняемая в пуле потоков."""
-        import ftplib
+        """Безопасный атомарный перенос свежего файла из общей папки FTP-сервера Docker."""
+        # Путь внутри контейнера, куда Docker-volume складывает файлы, загруженные 1С по FTP
+        ftp_shared_file = Path("/app/ftp_data") / self._settings.ftp_remote_path
 
-        # Гарантируем, что папка для скачивания существует
+        if not ftp_shared_file.exists():
+            logger.warning(
+                "[FTP/Storage] Свежий файл от 1С еще не загружен на FTP-сервер. Использую текущий локальный.")
+            return
+
+        # Гарантируем существование целевой папки
         self._csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Временный файл для безопасной атомарной перезаписи (исключает повреждение данных при обрыве)
+        # Временный файл для безопасной подмены (исключает чтение полузаписанного файла)
         tmp_path = self._csv_path.with_suffix(".tmp")
 
         try:
-            with ftplib.FTP() as ftp:
-                ftp.connect(self._settings.ftp_host, self._settings.ftp_port, timeout=15)
-                ftp.login(self._settings.ftp_user, self._settings.ftp_password.get_secret_value())
+            # Атомарно копируем файл из общей директории FTP
+            shutil.copy2(ftp_shared_file, tmp_path)
 
-                # Переключаемся в пассивный режим (критично для стабильной работы внутри Docker-контейнеров)
-                ftp.set_pasv(True)
-
-                with open(tmp_path, "wb") as local_file:
-                    ftp.retrbinary(f"RETR {self._settings.ftp_remote_path}", local_file.write)
-
-            # Атомарно заменяем старый файл новым
             if tmp_path.exists():
                 if self._csv_path.exists():
                     self._csv_path.unlink()
                 tmp_path.rename(self._csv_path)
+                logger.info("[FTP/Storage] Свежий stocks.csv успешно импортирован из папки FTP-сервера.")
+        except Exception as exc:
+            logger.error("[FTP/Storage] Критический сбой атомарного импорта файла: %s", exc)
+            raise OSError(f"Shared FTP file import failed: {exc}") from exc
         finally:
             if tmp_path.exists():
                 tmp_path.unlink()
