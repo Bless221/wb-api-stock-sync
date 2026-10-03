@@ -147,8 +147,6 @@ async def get_all_products(database_path: Path) -> dict[str, dict[str, Any]]:
     logger.debug("Loaded %d products from database for caching", len(result))
     return result
 
-    return result
-
 
 async def get_product_by_sku(database_path: Path, sku_internal: str) -> Optional[dict[str, Any]]:
     try:
