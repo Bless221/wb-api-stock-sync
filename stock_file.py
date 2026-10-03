@@ -148,40 +148,36 @@ class StockFileManager:
         return await loop.run_in_executor(None, self._read_csv_sync)
 
     def _read_csv_sync(self) -> tuple[int, pd.DataFrame]:
-        accumulated: dict[str, dict[str, Any]] = {}
         total_rows = 0
+        chunk_list = []
 
         try:
-            with open(self._csv_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
+            with pd.read_csv(
+                self._csv_path,
+                usecols=list(REQUIRED_COLUMNS),
+                chunksize=self._settings.csv_chunk_size,
+                encoding="utf-8"
+            ) as reader:
+                for chunk in reader:
+                    total_rows += len(chunk)
+                    
+                    chunk = chunk.dropna(subset=["item_sku"])
+                    chunk["item_sku"] = chunk["item_sku"].astype(str).str.strip()
+                    chunk = chunk[chunk["item_sku"] != ""]
+                    
+                    chunk_list.append(chunk)
 
-                if reader.fieldnames is None:
-                    raise StockFileError("Stock file has no header row")
+            if not chunk_list:
+                return 0, pd.DataFrame(columns=["item_sku", "quantity"])
 
-                for row_number, row in enumerate(reader, start=2):
-                    total_rows += 1
-
-                    sku = str(row.get("item_sku", "")).strip()
-                    if not sku:
-                        logger.debug("Row %d: empty item_sku, skipped", row_number)
-                        continue
-
-                    try:
-                        qty = int(float(row.get("quantity", 0)))
-                        qty = max(0, qty)
-                    except (ValueError, TypeError):
-                        logger.debug(
-                            "Row %d: invalid quantity for SKU=%s, skipped", row_number, sku
-                        )
-                        continue
-
-                    accumulated[sku] = {"item_sku": sku, "quantity": qty}
+            final_df = pd.concat(chunk_list, ignore_index=True)
+            
+            final_df = final_df.drop_duplicates(subset=["item_sku"], keep="last")
 
         except Exception as exc:
-            logger.exception("Failed to read stock file: %s", self._csv_path)
-            raise
+            logger.exception("Failed to read stock file via pandas streaming: %s", self._csv_path)
+            raise StockFileError(f"Pandas streaming read failed: {exc}") from exc
 
-        final_df = pd.DataFrame(list(accumulated.values()))
         logger.info(
             "Stock file processed in background thread: %d total lines parsed, %d unique SKUs loaded",
             total_rows,
