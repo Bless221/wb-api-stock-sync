@@ -63,6 +63,8 @@ class OzonClient:
         self._cooldown_until: float = 0.0
         self._state_lock = asyncio.Lock()
         self._batch_semaphore = asyncio.Semaphore(self._max_concurrent_batches)
+        # ИСПРАВЛЕНО: Интегрирован флаг Circuit Breaker для легкой версии Windows
+        self._is_disabled = False
 
     async def update_stocks(self, items: Sequence[OzonStockItem]) -> OzonSyncReport:
         started = time.monotonic()
@@ -81,6 +83,9 @@ class OzonClient:
             len(batches),
             self._max_concurrent_batches,
         )
+
+        # ИСПРАВЛЕНО: Сброс флага аварийного отключения перед запуском нового пула задач
+        self._is_disabled = False
 
         tasks = [
             self._send_batch_guarded(batch, number + 1, report)
@@ -104,12 +109,25 @@ class OzonClient:
             report: OzonSyncReport,
     ) -> None:
         async with self._batch_semaphore:
+            # ИСПРАВЛЕНО: Проверка флага Circuit Breaker при прохождении семафора
+            if self._is_disabled:
+                logger.warning("[OZON] Batch %d cancelled due to critical error in parallel task", number)
+                report.batches_failed += 1
+                report.failed_items += len(batch)
+                return
+
             try:
                 body = await self._send_batch(batch, number, report)
                 self._collect_item_results(body, number, report)
                 report.batches_ok += 1
-            except CriticalAPIError:
-                raise
+            except CriticalAPIError as exc:
+                # ИСПРАВЛЕНО: Ошибка перехватывается, взводится флаг, но исключение не пробрасывается.
+                # Это сохраняет мягкий рантайм, заполняет отчет и не рушит asyncio.gather.
+                self._is_disabled = True
+                report.batches_failed += 1
+                report.failed_items += len(batch)
+                report.errors.append(f"batch {number} critical: {exc}")
+                logger.error("[OZON] Batch %d failed with critical auth error, pipeline suspended", number)
             except Exception as exc:
                 report.batches_failed += 1
                 report.failed_items += len(batch)
@@ -133,7 +151,15 @@ class OzonClient:
         attempt = 0
 
         while True:
+            # ИСПРАВЛЕНО: Контроль флага Circuit Breaker на входе в цикл ретраев
+            if self._is_disabled:
+                raise Exception("Ozon API client disabled due to fatal error")
+
             await self._await_cooldown()
+
+            # ИСПРАВЛЕНО: Повторный контроль флага Circuit Breaker сразу после выхода из асинхронного сна
+            if self._is_disabled:
+                raise Exception("Ozon API client disabled due to fatal error")
 
             try:
                 async with self._session.post(url, json=payload, headers=headers) as response:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import random
 import time
@@ -61,6 +60,7 @@ class WildberriesClient:
         self._cooldown_until: float = 0.0
         self._state_lock = asyncio.Lock()
         self._batch_semaphore = asyncio.Semaphore(self._max_concurrent_batches)
+        self._is_disabled = False
 
     async def update_stocks(self, items: Sequence[WBStockItem]) -> WBSyncReport:
         started = time.monotonic()
@@ -75,6 +75,8 @@ class WildberriesClient:
         report.batches_total = len(batches)
         logger.info("[WB] Starting sync: %d items in %d batches", len(items), len(batches))
 
+        self._is_disabled = False
+
         tasks = [self._send_batch_guarded(batch, idx + 1, report) for idx, batch in enumerate(batches)]
         await asyncio.gather(*tasks)
 
@@ -84,11 +86,18 @@ class WildberriesClient:
 
     async def _send_batch_guarded(self, batch: Sequence[WBStockItem], number: int, report: WBSyncReport) -> None:
         async with self._batch_semaphore:
+            if self._is_disabled:
+                logger.warning("[WB] Batch %d cancelled due to fatal authentication error in parallel task", number)
+                report.batches_failed += 1
+                report.failed_items += len(batch)
+                return
+
             try:
                 await self._send_batch(batch, number, report)
                 report.batches_ok += 1
                 report.sent_items += len(batch)
             except CriticalAPIError:
+                self._is_disabled = True
                 raise
             except Exception as exc:
                 report.batches_failed += 1
@@ -106,11 +115,20 @@ class WildberriesClient:
         attempt = 0
 
         while True:
-            now = time.monotonic()
+            # ИСПРАВЛЕНО: Закрыта слепая зона Circuit Breaker.
+            # Если параллельный батч перехватил 401/403 ошибку, текущий поток мгновенно прерывается.
+            if self._is_disabled:
+                raise Exception("Marketplace integration disabled via parallel task event")
+
             async with self._state_lock:
+                now = time.monotonic()
                 diff = self._cooldown_until - now
-            if diff > 0:
-                await asyncio.sleep(diff)
+                if diff > 0:
+                    await asyncio.sleep(diff)
+
+            # ПОВТОРНАЯ ПРОВЕРКА ПОСЛЕ СОНА: Убеждаемся, что пока корутина спала, флаг аварии не взвели
+            if self._is_disabled:
+                raise Exception("Marketplace integration disabled via parallel task event")
 
             try:
                 async with self._session.put(url, json=payload, headers=headers) as response:
@@ -130,10 +148,10 @@ class WildberriesClient:
                         report.rate_limit_hits += 1
 
                     if status in RETRYABLE_STATUSES and attempt < self._max_retries:
-                        delay = min(self._backoff_max, self._backoff_base * (2 ** attempt)) + random.uniform(0, 0.5)
+                        delay = min(self._backoff_max, self._backoff_base * (2 ** attempt)) + random.uniform(0.0, 0.5)
                         async with self._state_lock:
                             self._cooldown_until = time.monotonic() + delay
-                        logger.warning("[WB] Batch %d got HTTP %d, retry in %.1fs", number, status, delay)
+                        logger.warning("[WB] Batch %d got HTTP %d, retry %d/%d in %.1fs", number, status, attempt + 1, self._max_retries, delay)
                         attempt += 1
                         await asyncio.sleep(delay)
                     else:
@@ -142,8 +160,9 @@ class WildberriesClient:
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 if attempt >= self._max_retries:
                     raise Exception(f"Network error after max retries: {exc}") from exc
-                delay = min(self._backoff_max, self._backoff_base * (2 ** attempt)) + random.uniform(0, 0.5)
+                delay = min(self._backoff_max, self._backoff_base * (2 ** attempt)) + random.uniform(0.0, 0.5)
                 async with self._state_lock:
                     self._cooldown_until = time.monotonic() + delay
+                logger.warning("[WB] Network error on batch %d, retry %d/%d in %.1fs: %s", number, attempt + 1, self._max_retries, delay, exc)
                 attempt += 1
                 await asyncio.sleep(delay)

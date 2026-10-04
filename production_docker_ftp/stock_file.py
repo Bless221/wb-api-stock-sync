@@ -25,12 +25,10 @@ class StockFileManager:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._csv_path = Path(settings.csv_path)
-        # ИСПРАВЛЕНО: Привязка пути бэкапов к выделенному Docker-тому /app/backups
         self._backup_dir = Path("/app/backups")
         self._backup_dir.mkdir(parents=True, exist_ok=True)
 
     async def download_from_ftp_if_enabled(self) -> None:
-        """Импортирует свежий файл остатков из общей папки FTP-сервера Docker перед началом цикла."""
         if not self._settings.enable_ftp_download:
             return
 
@@ -45,8 +43,6 @@ class StockFileManager:
             raise StockFileError(f"FTP shared import failed: {exc}") from exc
 
     def _download_ftp_sync(self) -> None:
-        """Безопасный атомарный перенос свежего файла из общей папки FTP-сервера Docker."""
-        # Путь внутри контейнера, куда Docker-volume складывает файлы, загруженные 1С по FTP
         ftp_shared_file = Path("/app/ftp_data") / self._settings.ftp_remote_path
 
         if not ftp_shared_file.exists():
@@ -54,14 +50,10 @@ class StockFileManager:
                 "[FTP/Storage] Свежий файл от 1С еще не загружен на FTP-сервер. Использую текущий локальный.")
             return
 
-        # Гарантируем существование целевой папки
         self._csv_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Временный файл для безопасной подмены (исключает чтение полузаписанного файла)
         tmp_path = self._csv_path.with_suffix(".tmp")
 
         try:
-            # Атомарно копируем файл из общей директории FTP
             shutil.copy2(ftp_shared_file, tmp_path)
 
             if tmp_path.exists():
@@ -69,6 +61,9 @@ class StockFileManager:
                     self._csv_path.unlink()
                 tmp_path.rename(self._csv_path)
                 logger.info("[FTP/Storage] Свежий stocks.csv успешно импортирован из папки FTP-сервера.")
+                # ИСПРАВЛЕНО: Вызов ftp_shared_file.unlink() полностью удален.
+                # Исходный файл выгрузки от 1С теперь не удаляется с FTP-сервера.
+
         except Exception as exc:
             logger.error("[FTP/Storage] Критический сбой атомарного импорта файла: %s", exc)
             raise OSError(f"Shared FTP file import failed: {exc}") from exc

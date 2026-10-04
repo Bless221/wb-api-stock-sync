@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from typing import Optional, Any
 
@@ -18,8 +17,8 @@ class TelegramNotifier:
         self._settings = settings
         self._session = session
         self._owns_session = session is None
-        # ИСПРАВЛЕНО: Установлен официальный домен Telegram Bot API
-        self._base_url = "https://telegram.org"
+        # ИСПРАВЛЕНО: Установлен корректный официальный домен Telegram Bot API
+        self._base_url = "https://api.telegram.org"
         self._has_alerts = settings.telegram_bot_token is not None and settings.telegram_chat_id is not None
 
         if not self._has_alerts:
@@ -41,7 +40,7 @@ class TelegramNotifier:
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=self._settings.request_timeout)
-            connector = aiohttp.TCPConnector(limit=5, ttl_dns_cache=300)
+            connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
             self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
             self._owns_session = True
         return self._session

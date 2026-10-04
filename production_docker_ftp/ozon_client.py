@@ -63,6 +63,7 @@ class OzonClient:
         self._cooldown_until: float = 0.0
         self._state_lock = asyncio.Lock()
         self._batch_semaphore = asyncio.Semaphore(self._max_concurrent_batches)
+        self._is_disabled = False
 
     async def update_stocks(self, items: Sequence[OzonStockItem]) -> OzonSyncReport:
         started = time.monotonic()
@@ -81,6 +82,8 @@ class OzonClient:
             len(batches),
             self._max_concurrent_batches,
         )
+
+        self._is_disabled = False
 
         tasks = [
             self._send_batch_guarded(batch, number + 1, report)
@@ -104,12 +107,24 @@ class OzonClient:
             report: OzonSyncReport,
     ) -> None:
         async with self._batch_semaphore:
+            if self._is_disabled:
+                logger.warning("[OZON] Batch %d cancelled due to critical error in parallel task", number)
+                report.batches_failed += 1
+                report.failed_items += len(batch)
+                return
+
             try:
                 body = await self._send_batch(batch, number, report)
                 self._collect_item_results(body, number, report)
                 report.batches_ok += 1
-            except CriticalAPIError:
-                raise
+            except CriticalAPIError as exc:
+                # ИСПРАВЛЕНО: Флаг взводится, но исключение гасится локально для сохранения
+                # результатов других батчей и корректного формирования итогового OzonSyncReport
+                self._is_disabled = True
+                report.batches_failed += 1
+                report.failed_items += len(batch)
+                report.errors.append(f"batch {number} critical: {exc}")
+                logger.error("[OZON] Batch %d failed with critical auth error, pipeline suspended", number)
             except Exception as exc:
                 report.batches_failed += 1
                 report.failed_items += len(batch)
@@ -133,7 +148,19 @@ class OzonClient:
         attempt = 0
 
         while True:
-            await self._await_cooldown()
+            # ИСПРАВЛЕНО: Закрыта слепая зона Circuit Breaker на входе в цикл
+            if self._is_disabled:
+                raise Exception("Ozon API client disabled due to fatal error")
+
+            async with self._state_lock:
+                now = time.monotonic()
+                diff = self._cooldown_until - now
+                if diff > 0:
+                    await asyncio.sleep(diff)
+
+            # ИСПРАВЛЕНО: Повторная проверка флага аварии после выхода из состояния сна
+            if self._is_disabled:
+                raise Exception("Ozon API client disabled due to fatal error")
 
             try:
                 async with self._session.post(url, json=payload, headers=headers) as response:
@@ -148,7 +175,8 @@ class OzonClient:
                         )
 
                     if status == 200:
-                        await self._relax_cooldown()
+                        async with self._state_lock:
+                            self._cooldown_until = time.monotonic() + self._base_delay
                         return self._parse_json(text)
 
                     if status == 429:
@@ -170,18 +198,9 @@ class OzonClient:
                 if attempt >= self._max_retries:
                     raise Exception(f"Network error after max retries: {exc}") from exc
                 delay = await self._register_failure(attempt, None)
-                logger.warning("[OZON] Network error on batch %d, retrying in %.1fs: %s", number, delay, exc)
+                logger.warning("[OZON] Network error on batch %d, retry %d/%d in %.1fs: %s", number, attempt + 1, self._max_retries, delay, exc)
                 attempt += 1
                 await asyncio.sleep(delay)
-
-    async def _await_cooldown(self) -> None:
-        while True:
-            now = time.monotonic()
-            async with self._state_lock:
-                diff = self._cooldown_until - now
-                if diff <= 0:
-                    return
-            await asyncio.sleep(diff)
 
     async def _register_failure(self, attempt: int, retry_after: Optional[float]) -> float:
         async with self._state_lock:
@@ -189,13 +208,9 @@ class OzonClient:
                 delay = retry_after
             else:
                 delay = min(self._backoff_max, self._backoff_base * (2 ** attempt))
-                delay += random.uniform(0, 0.5 * delay)
+                delay += random.uniform(0.0, 0.5 * delay)
             self._cooldown_until = time.monotonic() + delay
             return delay
-
-    async def _relax_cooldown(self) -> None:
-        async with self._state_lock:
-            self._cooldown_until = time.monotonic() + self._base_delay
 
     def _collect_item_results(self, response_data: dict[str, Any], batch_number: int, report: OzonSyncReport) -> None:
         results = response_data.get("result", [])
@@ -219,8 +234,7 @@ class OzonClient:
                 if isinstance(errors, dict):
                     err_msg = errors.get("message", "Unknown error")
                 elif isinstance(errors, list) and errors:
-                    err_msg = errors[0].get("message", "Unknown error") if isinstance(errors[0], dict) else str(
-                        errors[0])
+                    err_msg = errors[0].get("message", "Unknown error") if isinstance(errors[0], dict) else str(errors[0])
 
                 logger.warning("[OZON] SKU %s rejected: %s", item.get("offer_id"), err_msg)
 
@@ -262,3 +276,4 @@ class OzonClient:
         except Exception:
             pass
         return body[:200]
+
