@@ -1,0 +1,55 @@
+{
+  "version": "2.0",
+  "description": "Cross-marketplace product mapping: internal warehouse SKU -> Wildberries barcode + Ozon offer_id",
+  "items": [
+    {
+      "sku_internal": "SKU-1001",
+      "title": "Футболка оверсайз, белая, M",
+      "wb_barcode": "2000000010014",
+      "ozon_offer_id": "TS-OVER-WHT-M",
+      "active": true
+    },
+    {
+      "sku_internal": "SKU-1002",
+      "title": "Футболка оверсайз, белая, L",
+      "wb_barcode": "2000000010021",
+      "ozon_offer_id": "TS-OVER-WHT-L",
+      "active": true
+    },
+    {
+      "sku_internal": "SKU-1003",
+      "title": "Худи флис, черное, M",
+      "wb_barcode": "2000000010038",
+      "ozon_offer_id": "HD-FLC-BLK-M",
+      "active": true
+    },
+    {
+      "sku_internal": "SKU-1004",
+      "title": "Худи флис, черное, L",
+      "wb_barcode": "2000000010045",
+      "ozon_offer_id": "HD-FLC-BLK-L",
+      "active": true
+    },
+    {
+      "sku_internal": "SKU-2001",
+      "title": "Кружка керамическая 350 мл (только WB)",
+      "wb_barcode": "2000000020013",
+      "ozon_offer_id": null,
+      "active": true
+    },
+    {
+      "sku_internal": "SKU-2002",
+      "title": "Термокружка 500 мл (только Ozon)",
+      "wb_barcode": null,
+      "ozon_offer_id": "MUG-THERMO-500",
+      "active": true
+    },
+    {
+      "sku_internal": "SKU-9000",
+      "title": "Архивная позиция, выведена из продажи",
+      "wb_barcode": "2000000090016",
+      "ozon_offer_id": "ARCHIVE-9000",
+      "active": false
+    }
+  ]
+}
