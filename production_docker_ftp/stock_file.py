@@ -25,7 +25,8 @@ class StockFileManager:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._csv_path = Path(settings.csv_path)
-        self._backup_dir = Path(settings.database_path).parent / "backups"
+        # ИСПРАВЛЕНО: Привязка пути бэкапов к выделенному Docker-тому /app/backups
+        self._backup_dir = Path("/app/backups")
         self._backup_dir.mkdir(parents=True, exist_ok=True)
 
     async def download_from_ftp_if_enabled(self) -> None:

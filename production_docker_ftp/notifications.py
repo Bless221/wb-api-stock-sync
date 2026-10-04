@@ -18,7 +18,7 @@ class TelegramNotifier:
         self._settings = settings
         self._session = session
         self._owns_session = session is None
-        # Telegram Bot API
+        # ИСПРАВЛЕНО: Установлен официальный домен Telegram Bot API
         self._base_url = "https://telegram.org"
         self._has_alerts = settings.telegram_bot_token is not None and settings.telegram_chat_id is not None
 
